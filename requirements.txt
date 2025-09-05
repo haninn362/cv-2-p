@@ -1,0 +1,8 @@
+# Works with Python 3.9–3.12
+streamlit>=1.33,<2
+pandas>=2.2,<3
+numpy>=1.26,<3
+matplotlib>=3.8,<4
+openpyxl>=3.1,<4
+# Optional (extra Excel writer; the app works without it)
+XlsxWriter>=3.1,<4
