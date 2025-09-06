@@ -1,5 +1,4 @@
 import io
-import math
 import re
 from typing import Tuple
 
@@ -15,7 +14,37 @@ CV2_CUTOFF = 0.49
 
 st.set_page_config(page_title="Classification de la demande — p & CV²", layout="wide")
 
-# ---------------- logique principale ----------------
+# ======================== Styles (en-tête collant) ==========================
+st.markdown(
+    """
+    <style>
+      .sticky-header {
+        position: sticky;
+        top: 0;
+        z-index: 9999;
+        background: rgba(255,255,255,0.98);
+        -webkit-backdrop-filter: blur(6px);
+        backdrop-filter: blur(6px);
+        border-bottom: 1px solid rgba(49,51,63,0.2);
+        padding: 0.5rem 0.5rem 0.75rem 0.5rem;
+      }
+      @media (prefers-color-scheme: dark) {
+        .sticky-header { background: rgba(13,17,23,0.9); border-bottom-color: rgba(255,255,255,0.12); }
+      }
+      .sticky-header .stButton>button {
+        font-weight: 600;
+        border-radius: 10px;
+      }
+      .sticky-header .stFileUploader>div>div {
+        border-radius: 10px;
+      }
+      .tight { margin-bottom: 0.35rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ============================ Logique principale ============================
 def choose_method(p: float, cv2: float) -> Tuple[str, str]:
     """Retourne (Catégorie, Méthode suggérée)."""
     if pd.isna(p) or pd.isna(cv2):
@@ -35,20 +64,15 @@ def compute_everything(df: pd.DataFrame):
     df : 1re colonne = produit, colonnes 2..N = dates/périodes avec quantités.
     Renvoie : combined_df, stats_df, counts_df, methods_df
     """
-    # périodes
     date_cols = list(df.columns[1:])
     parsed_dates = pd.to_datetime(date_cols, errors="coerce")
     n_periods = int(parsed_dates.notna().sum()) or len(date_cols)
 
-    # collecte non-zéro & inter-arrivées
-    combined_rows = []
-    per_product_vals = {}
-    max_len = 0
+    combined_rows, per_product_vals, max_len = [], {}, 0
 
     for _, row in df.iterrows():
         produit = str(row.iloc[0])
         numeric = pd.to_numeric(row.iloc[1:], errors="coerce").fillna(0).values
-
         nz = numeric != 0
         vals = numeric[nz].tolist()
 
@@ -63,7 +87,6 @@ def compute_everything(df: pd.DataFrame):
         combined_rows.append((produit, vals, inter_arrivals))
         per_product_vals[produit] = vals
 
-    # Tableau combiné (taille/fréquence)
     final_rows = []
     for produit, pv, ia in combined_rows:
         pv = list(pv) + [""] * (max_len - len(pv))
@@ -72,13 +95,12 @@ def compute_everything(df: pd.DataFrame):
         final_rows.append(["", "frequence"] + ia)
     combined_df = pd.DataFrame(final_rows, columns=["Produit", "Type"] + list(range(max_len)))
 
-    # Tableau 1 — moyenne / écart-type / CV² (sur non-zéro)
     stats_rows = []
     for produit, vals in per_product_vals.items():
         if vals:
             s = pd.Series(vals, dtype="float64")
             moyenne = s.mean()
-            ecart = s.std(ddof=1)                # écart-type échantillon
+            ecart = s.std(ddof=1)
             cv2 = (ecart / moyenne) ** 2 if moyenne != 0 else np.nan
         else:
             moyenne = ecart = cv2 = np.nan
@@ -86,11 +108,9 @@ def compute_everything(df: pd.DataFrame):
 
     stats_df = (
         pd.DataFrame(stats_rows, columns=["Produit", "moyenne", "écart-type", "CV^2"])
-        .set_index("Produit")
-        .sort_index()
+        .set_index("Produit").sort_index()
     )
 
-    # Tableau 2 — N périodes / N fréquences / p
     counts_rows = []
     for produit, vals in per_product_vals.items():
         n_freq = len(vals)
@@ -99,14 +119,11 @@ def compute_everything(df: pd.DataFrame):
 
     counts_df = (
         pd.DataFrame(counts_rows, columns=["Produit", "N périodes", "N fréquences", "p"])
-        .set_index("Produit")
-        .sort_index()
+        .set_index("Produit").sort_index()
     )
 
-    # Méthodes (classification)
     methods_df = stats_df.join(counts_df, how="outer")
-    cats = methods_df.apply(lambda r: choose_method(r["p"], r["CV^2"]),
-                            axis=1, result_type="expand")
+    cats = methods_df.apply(lambda r: choose_method(r["p"], r["CV^2"]), axis=1, result_type="expand")
     methods_df["Catégorie"] = cats[0]
     methods_df["Méthode suggérée"] = cats[1]
     methods_df = methods_df[["CV^2", "p", "Catégorie", "Méthode suggérée"]]
@@ -135,7 +152,7 @@ def make_plot(methods_df: pd.DataFrame):
     return fig
 
 def excel_bytes(combined_df, stats_df, counts_df, methods_df) -> io.BytesIO:
-    """Crée un Excel avec : Tableau 1, Tableau 2, Combiné, Méthodes."""
+    """Crée un Excel : Tableau 1, Tableau 2, Combiné, Méthodes."""
     buf = io.BytesIO()
     for engine in ("openpyxl", "xlsxwriter", None):
         try:
@@ -155,7 +172,7 @@ def excel_bytes(combined_df, stats_df, counts_df, methods_df) -> io.BytesIO:
     buf.seek(0)
     return buf
 
-# -------- fonctionnalité d'optimisation (n*, Qr*, Qw*) --------
+# ======================== Optimisation (n*, Qr*, Qw*) =======================
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
@@ -199,42 +216,36 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
 
     xls = pd.ExcelFile(io.BytesIO(data_bytes))
 
-    # feuille de consommation
+    # Feuille consommation
     sheet_names_norm = {_norm(s): s for s in xls.sheet_names}
     conso_sheet = sheet_names_norm.get(_norm(conso_sheet_hint))
     if not conso_sheet:
-        candidats = [s for s in xls.sheet_names if _norm(conso_sheet_hint) in _norm(s)]
-        if candidats:
-            conso_sheet = candidats[0]
+        cands = [s for s in xls.sheet_names if _norm(conso_sheet_hint) in _norm(s)]
+        if cands:
+            conso_sheet = cands[0]
     if not conso_sheet:
         warn_msgs.append("Feuille 'consommation depots externe' introuvable.")
         return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
 
     df_conso = pd.read_excel(io.BytesIO(data_bytes), sheet_name=conso_sheet)
 
-    # préférer explicitement 'Quantite STIAL'
+    # Préférence forte pour 'Quantite STIAL'
     code_col = next((c for c in df_conso.columns if "code produit" in _norm(c)), None) or "Code Produit"
     qty_col = None
-    # correspondance exacte
     for c in df_conso.columns:
         nc = _norm(c)
         if nc == "quantite stial" or nc == "quantité stial":
-            qty_col = c
-            break
-    # sous-chaîne
+            qty_col = c; break
     if qty_col is None:
         for c in df_conso.columns:
             nc = _norm(c)
             if "quantite stial" in nc or "quantité stial" in nc:
-                qty_col = c
-                break
-    # repli générique
+                qty_col = c; break
     if qty_col is None:
         for key in ["quantite", "quantité", "qte"]:
             cand = next((c for c in df_conso.columns if key in _norm(c)), None)
             if cand:
-                qty_col = cand
-                break
+                qty_col = cand; break
 
     if code_col is None or qty_col is None:
         warn_msgs.append("Colonnes 'Code Produit' et/ou 'Quantite STIAL' introuvables.")
@@ -244,17 +255,17 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
     info_msgs.append(f"Feuille de consommation : '{conso_sheet}' (lignes : {len(df_conso)})")
     info_msgs.append(f"Colonne quantité utilisée : '{qty_col}'")
 
-    # détecter 'time serie*' / 'time series*'
+    # Feuilles time serie*
     ts_sheets = [s for s in xls.sheet_names if _norm(s).startswith(_norm(time_series_prefix))]
     if not ts_sheets:
         warn_msgs.append("Aucune feuille 'time serie*' trouvée (ex. 'time serie EM0400').")
         return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
 
-    résultats = []
+    rows = []
     for sheet in ts_sheets:
         try:
             df = pd.read_excel(io.BytesIO(data_bytes), sheet_name=sheet)
-            code_produit = sheet.split()[-1]  # dernier token du nom de feuille
+            code_produit = sheet.split()[-1]
 
             cr_col = _find_first_col(df, starts_with="cr")
             cw_col = _find_first_col(df, starts_with="cw")
@@ -283,8 +294,7 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
             tau = 1
             denom = (n_star * C_w + C_r * tau)
             if denom <= 0:
-                warn_msgs.append(f"[{sheet}] Dénominateur non positif pour Q* — ignoré.")
-                continue
+                warn_msgs.append(f"[{sheet}] Dénominateur non positif pour Q* — ignoré."); continue
 
             if D is None or D <= 0:
                 warn_msgs.append(f"[{sheet}] Demande non positive D={D} → Q*=0.")
@@ -294,7 +304,7 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
 
             Q_w_star = n_star * Q_r_star
 
-            résultats.append({
+            rows.append({
                 "Code Produit": str(code_produit),
                 "n*": int(n_star),
                 "Qr*": round(float(Q_r_star), 2),
@@ -303,43 +313,46 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
         except Exception as e:
             warn_msgs.append(f"[{sheet}] Échec : {e}")
 
-    result_df = pd.DataFrame(résultats).sort_values("Code Produit") if résultats else pd.DataFrame(
+    result_df = pd.DataFrame(rows).sort_values("Code Produit") if rows else pd.DataFrame(
         columns=["Code Produit", "n*", "Qr*", "Qw*"]
     )
     return result_df, info_msgs, warn_msgs
 
-# ---------------- interface ----------------
+# ============================== Interface ==============================
 st.title("Classification minimale — taille/fréquence → CV² & p → méthode")
 
-# --- État & barre latérale (téléverseurs en haut, puis Réinitialiser) ---
+# État pour réinitialisation
 if "uploader_nonce" not in st.session_state:
     st.session_state["uploader_nonce"] = 0
+nonce = st.session_state["uploader_nonce"]
 
-nonce = st.session_state.get("uploader_nonce", 0)
-
-with st.sidebar:
-    st.header("Fichiers")
+# ---------- En-tête collant (téléverseurs + reset) ----------
+st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
+c1, c2, c3 = st.columns([3, 3, 1.2])
+with c1:
     uploaded = st.file_uploader(
-        "Classeur de classification (.xlsx/.xls)\nColonne 1 = Produit, colonnes 2..N = périodes avec quantités.",
+        "Classeur de **classification** (.xlsx/.xls)\nColonne 1 = Produit, colonnes 2..N = périodes avec quantités.",
         type=["xlsx", "xls"],
-        key=f"clf_{nonce}"
+        key=f"clf_{nonce}",
+        help="Sélectionnez le fichier contenant la table large Produit × Périodes."
     )
+with c2:
     uploaded_opt = st.file_uploader(
-        "Classeur d’optimisation (.xlsx/.xls) — optionnel si différent",
+        "Classeur d’**optimisation** (.xlsx/.xls) — optionnel",
         type=["xlsx", "xls"],
-        key=f"opt_{nonce}"
+        key=f"opt_{nonce}",
+        help="Fichier contenant la feuille 'consommation depots externe' et les feuilles 'time serie *'."
     )
-    st.divider()
-    st.header("Actions")
-    if st.button("🔄 Réinitialiser les données"):
+with c3:
+    st.markdown("&nbsp;", unsafe_allow_html=True)
+    if st.button("🔄 Réinitialiser", use_container_width=True, help="Efface les fichiers et la sélection actuelle."):
         st.session_state["uploader_nonce"] += 1
         for k in ["selected_product"]:
             st.session_state.pop(k, None)
-        try:
-            st.rerun()
-        except Exception:
-            st.experimental_rerun()
+        st.rerun()
+st.markdown('</div>', unsafe_allow_html=True)
 
+# ---------- Sélection de feuille & calculs ----------
 sheet_name = None
 if uploaded is not None:
     try:
@@ -354,30 +367,27 @@ if uploaded is not None and sheet_name is not None:
     try:
         df_raw = pd.read_excel(uploaded, sheet_name=sheet_name)
 
-        # Sélecteur de produit (affichage unitaire)
+        # Sélecteur de produit
         col_produit = df_raw.columns[0]
         produits = sorted(df_raw[col_produit].astype(str).dropna().unique().tolist())
         if not produits:
             st.warning("Aucun produit trouvé dans la première colonne.")
         produit_sel = st.selectbox("Choisir un produit", options=produits, key="selected_product")
 
-        # Calculs globaux puis filtrage
         combined_df, stats_df, counts_df, methods_df = compute_everything(df_raw)
 
         stats_one = stats_df.loc[[produit_sel]] if produit_sel in stats_df.index else stats_df.iloc[0:0]
         counts_one = counts_df.loc[[produit_sel]] if produit_sel in counts_df.index else counts_df.iloc[0:0]
         methods_one = methods_df.loc[[produit_sel]] if produit_sel in methods_df.index else methods_df.iloc[0:0]
 
-        # Tableaux 1 & 2 (sélection)
-        c1, c2 = st.columns(2)
-        with c1:
+        cA, cB = st.columns(2)
+        with cA:
             st.markdown("**Tableau 1 — moyenne / écart-type / CV² (sélection)**")
             st.dataframe(stats_one.reset_index(), use_container_width=True)
-        with c2:
+        with cB:
             st.markdown("**Tableau 2 — N périodes / N fréquences / p (sélection)**")
             st.dataframe(counts_one.reset_index(), use_container_width=True)
 
-        # Combiné (deux lignes : taille & frequence)
         st.markdown("**Combiné — taille / frequence (sélection)**")
         comb_sel = pd.DataFrame()
         if not combined_df.empty:
@@ -386,14 +396,10 @@ if uploaded is not None and sheet_name is not None:
                 idx = combined_df.index[mask_taille][0]
                 rows = [idx]
                 if idx + 1 in combined_df.index:
-                    rows.append(idx + 1)  # la ligne 'frequence' suit
+                    rows.append(idx + 1)
                 comb_sel = combined_df.loc[rows]
-        if comb_sel.empty:
-            st.info("Aucune ligne combinée trouvée pour ce produit.")
-        else:
-            st.dataframe(comb_sel, use_container_width=True)
+        st.dataframe(comb_sel if not comb_sel.empty else pd.DataFrame(), use_container_width=True)
 
-        # Graphe (point sélectionné uniquement)
         st.markdown("**Graphe — p vs CV² avec seuils (sélection)**")
         if not methods_one.empty:
             fig = make_plot(methods_one)
@@ -401,22 +407,19 @@ if uploaded is not None and sheet_name is not None:
         else:
             st.info("Pas de graphe pour ce produit.")
 
-        # Méthode (sélection)
         st.markdown("**Méthode par produit (sélection)**")
         st.dataframe(methods_one.reset_index(), use_container_width=True)
 
-        # --- Optimisation (n*, Qr*, Qw*) ---
+        # ---- Optimisation (n*, Qr*, Qw*) ----
         st.markdown("**Optimisation — n\\*, Qr\\*, Qw\\* (sélection)**")
         opt_source = uploaded_opt or uploaded
         st.caption("Classeur utilisé : " + ("optimisation séparé" if uploaded_opt is not None else "classification"))
         opt_df, info_msgs, warn_msgs = compute_qr_qw_from_workbook(opt_source)
-        for msg in info_msgs:
-            st.info(msg)
-        for msg in warn_msgs:
-            st.warning(msg)
+        for msg in info_msgs: st.info(msg)
+        for msg in warn_msgs: st.warning(msg)
 
-        # Tentative de mappage du libellé vers un code (ex. 'EM0400')
-        m = re.search(r"\b[A-Z]{2}\d{4}\b", str(produit_sel))
+        import re as _re
+        m = _re.search(r"\b[A-Z]{2}\d{4}\b", str(produit_sel))
         opt_key = m.group(0) if m else str(produit_sel)
         opt_one = opt_df[opt_df["Code Produit"].astype(str) == opt_key]
         if opt_one.empty:
