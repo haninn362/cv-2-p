@@ -41,9 +41,9 @@ st.markdown(
       /* Masquer l’en-tête Streamlit par défaut */
       header[data-testid="stHeader"] { display: none; }
 
-      /* Laisser de la place sous la barre fixe (responsive) */
-      .block-container { padding-top: 128px; }
-      @media (max-width: 880px) { .block-container { padding-top: 160px; } }
+      /* Laisser de la place sous la barre fixe (2 rangées: logos + contrôles) */
+      .block-container { padding-top: 176px; }
+      @media (max-width: 880px) { .block-container { padding-top: 208px; } }
 
       /* Barre fixe */
       .fixed-header {
@@ -54,17 +54,13 @@ st.markdown(
         box-shadow: 0 2px 10px rgba(0,0,0,.05);
       }
       .fixed-inner {
-        padding: .55rem .9rem;
+        padding: .55rem .9rem .8rem;
         max-width: 1200px;
         margin: 0 auto;
       }
-      .row { display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; }
-      .row .left, .row .right { flex: 0 0 auto; display:flex; align-items:center; gap:.5rem; }
-      .row .mid { flex: 1 1 auto; display:flex; gap:.75rem; align-items:center; justify-content:center; }
 
       /* Trois contrôles = même taille (2 uploaders + reset) */
       :root { --ctrl-h: 46px; }
-      .uploader, .resetbtn { min-width: 240px; flex: 1 1 0; }
 
       /* Uploaders compacts et arrondis */
       .fixed-header .stFileUploader { width: 100%; }
@@ -90,7 +86,7 @@ st.markdown(
 
       /* Logos */
       .logo { display:flex; align-items:center; height: var(--ctrl-h); }
-      .logo img { max-height: 44px; width:auto; }
+      .logo img { max-height: 46px; width:auto; }
       .logo-miss { color: #c81d25; font-weight:600; }
     </style>
     """,
@@ -379,51 +375,45 @@ if "uploader_nonce" not in st.session_state:
     st.session_state["uploader_nonce"] = 0
 nonce = st.session_state["uploader_nonce"]
 
-# ---------- BARRE FIXE (logos + 2 uploaders + reset) ----------
+# ---------- BARRE FIXE ----------
 st.markdown('<div class="fixed-header"><div class="fixed-inner">', unsafe_allow_html=True)
 
-colL, colU1, colU2, colR = st.columns([1.0, 3.0, 3.0, 1.0])
-
-with colL:
-    st.markdown('<div class="row left">', unsafe_allow_html=True)
+# Rangée 1 : logos en coins (gauche/droite)
+logo_left, logo_spacer, logo_right = st.columns([1, 10, 1])
+with logo_left:
     if DELICE_LOGO_PATH.exists():
-        st.image(str(DELICE_LOGO_PATH), width=90)
+        st.image(str(DELICE_LOGO_PATH), width=95)
     else:
-        st.caption(f'<span class="logo-miss">Logo Délice manquant</span>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.caption('<span class="logo-miss">Logo Délice manquant</span>', unsafe_allow_html=True)
+with logo_right:
+    if POLYTECH_LOGO_PATH.exists():
+        st.image(str(POLYTECH_LOGO_PATH), width=55)
+    else:
+        st.caption('<span class="logo-miss">Logo PI manquant</span>', unsafe_allow_html=True)
+
+# Rangée 2 : 3 contrôles alignés à droite
+spacer, colU1, colU2, colR = st.columns([6, 3.2, 3.2, 2.2])
 
 with colU1:
-    st.markdown('<div class="row mid uploader">', unsafe_allow_html=True)
     uploaded = st.file_uploader(
         "Classeur **classification**",
         type=["xlsx", "xls"],
         key=f"clf_{nonce}",
         help="Feuille choisie = table large Produit × Périodes."
     )
-    st.markdown('</div>', unsafe_allow_html=True)
-
 with colU2:
-    st.markdown('<div class="row mid uploader">', unsafe_allow_html=True)
     uploaded_opt = st.file_uploader(
         "Classeur **optimisation** (optionnel)",
         type=["xlsx", "xls"],
         key=f"opt_{nonce}",
         help="Inclut 'consommation depots externe' + feuilles 'time serie *'."
     )
-    st.markdown('</div>', unsafe_allow_html=True)
-
 with colR:
-    st.markdown('<div class="row right">', unsafe_allow_html=True)
     if st.button("🔄 Réinitialiser", key=f"reset_{nonce}", help="Efface les fichiers et la sélection.", use_container_width=True):
         st.session_state["uploader_nonce"] += 1
         for k in ["selected_product"]:
             st.session_state.pop(k, None)
         st.rerun()
-    if POLYTECH_LOGO_PATH.exists():
-        st.image(str(POLYTECH_LOGO_PATH), width=44)
-    else:
-        st.caption(f'<span class="logo-miss">Logo PI manquant</span>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown('</div></div>', unsafe_allow_html=True)
 # ----------------------------- FIN BARRE FIXE -----------------------------
@@ -501,7 +491,7 @@ def compute_and_show(uploaded, sheet_name, uploaded_opt):
         st.warning(msg)
 
     # Essayer d’extraire un code comme EM0400 depuis le libellé
-    m = re.search(r"\b[A-Z]{2}\d{4}\b", str(produit_sel))
+    m = re.search(r"\\b[A-Z]{2}\\d{4}\\b", str(produit_sel))
     opt_key = m.group(0) if m else str(produit_sel)
     opt_one = opt_df[opt_df["Code Produit"].astype(str) == opt_key]
     if opt_one.empty:
