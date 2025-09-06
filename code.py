@@ -172,10 +172,16 @@ def _find_first_col(df: pd.DataFrame, starts_with: str = None, contains: str = N
 
 def _get_excel_bytes(file_like) -> bytes:
     """Safely obtain the raw bytes from an UploadedFile or file-like so we can read multiple times."""
+    if file_like is None:
+        return b""
     if hasattr(file_like, "getvalue"):
-        return file_like.getvalue()
+        try:
+            return file_like.getvalue()
+        except Exception:
+            pass
     try:
-        return file_like.read()
+        data = file_like.read()
+        return data
     finally:
         try:
             file_like.seek(0)
@@ -193,6 +199,9 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
         return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
 
     data_bytes = _get_excel_bytes(file_like)
+    if not data_bytes:
+        warn_msgs.append("Optimisation workbook is empty or unreadable.")
+        return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
 
     # --- pick the consumption sheet (default: 'consommation depots externe')
     xls = pd.ExcelFile(io.BytesIO(data_bytes))
@@ -292,8 +301,17 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
 # ---------------- UI ----------------
 st.title("Minimal demand classification — taille/frequence → CV² & p → method")
 
-uploaded = st.file_uploader("Upload Excel (.xlsx/.xls). Col 0 = Product, cols 1..N = date headers with quantities.",
-                            type=["xlsx", "xls"])
+# Two uploaders: 1) classification workbook, 2) optimisation workbook (optional / different file)
+uploaded = st.file_uploader(
+    "Upload classification workbook (.xlsx/.xls). Col 0 = Product, cols 1..N = date headers with quantities.",
+    type=["xlsx", "xls"],
+    key="clf"
+)
+uploaded_opt = st.file_uploader(
+    "Upload optimisation workbook (.xlsx/.xls) — optional if different from the first file",
+    type=["xlsx", "xls"],
+    key="opt"
+)
 
 sheet_name = None
 if uploaded is not None:
@@ -302,7 +320,7 @@ if uploaded is not None:
         # prefer a sheet named 'classification' if present
         names_lower = [s.lower() for s in xls.sheet_names]
         default_idx = names_lower.index("classification") if "classification" in names_lower else 0
-        sheet_name = st.selectbox("Sheet", options=xls.sheet_names, index=default_idx)
+        sheet_name = st.selectbox("Sheet (classification workbook)", options=xls.sheet_names, index=default_idx)
     except Exception as e:
         st.error(f"Could not read workbook: {e}")
 
@@ -335,7 +353,14 @@ if uploaded is not None and sheet_name is not None:
 
         # --- New section: Optimization results (n*, Qr*, Qw*) ---
         st.markdown("**Optimisation — n\\*, Qr\\*, Qw\\* par produit**")
-        opt_df, info_msgs, warn_msgs = compute_qr_qw_from_workbook(uploaded)
+        # Use second file if provided, else fall back to the classification workbook
+        opt_source = uploaded_opt or uploaded
+        if uploaded_opt is not None:
+            st.caption("Using the separate optimisation workbook you uploaded.")
+        else:
+            st.caption("No separate optimisation workbook uploaded — using the classification workbook.")
+
+        opt_df, info_msgs, warn_msgs = compute_qr_qw_from_workbook(opt_source)
 
         for msg in info_msgs:
             st.info(msg)
@@ -355,7 +380,7 @@ if uploaded is not None and sheet_name is not None:
         pbuf.seek(0)
         st.download_button("Download graph (PNG)", data=pbuf, file_name="classification_grid_p.png", mime="image/png")
 
-        # Download CSV for the new results
+        # Download CSV for the new optimisation results
         st.download_button(
             "Download optimisation results (CSV)",
             data=opt_df.to_csv(index=False).encode("utf-8"),
@@ -365,4 +390,4 @@ if uploaded is not None and sheet_name is not None:
     except Exception as e:
         st.error(f"Processing failed: {e}")
 else:
-    st.info("Upload a file to start.")
+    st.info("Upload the classification workbook to start. (You can also upload a separate optimisation workbook.)")
