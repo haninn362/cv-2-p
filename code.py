@@ -7,6 +7,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
+# ------------ Config logos (place the files next to app.py) ---------------
+DELiCE_LOGO_PATH = "delice_logo.png"     # <- use your Délice image
+POLYTECH_LOGO_PATH = "polytech_logo.png" # <- use your Polytech image
+
 # --- Seuils Syntetos & Boylan ---
 ADI_CUTOFF = 1.32
 P_CUTOFF = 1.0 / ADI_CUTOFF       # ≈ 0,757576
@@ -14,58 +18,67 @@ CV2_CUTOFF = 0.49
 
 st.set_page_config(page_title="Classification de la demande — p & CV²", layout="wide")
 
-# ======================== Styles (barre FIXE en tout haut) ==================
+# ======================== Styles (barre FIXE tout en haut) ==================
 st.markdown(
     """
     <style>
-      /* Masquer l’en-tête Streamlit par défaut et récupérer l’espace */
+      /* Masquer l’entête Streamlit par défaut */
       header[data-testid="stHeader"] { display: none; }
 
-      /* Donner de l’espace sous la barre fixe (hauteur ~120px) */
-      .block-container { padding-top: 120px; }
+      /* Laisser la place sous la barre fixe (ajustée responsive) */
+      .block-container { padding-top: 128px; }
+      @media (max-width: 880px) { .block-container { padding-top: 160px; } }
 
-      /* Barre fixe tout en haut */
+      /* Barre fixe */
       .fixed-header {
-        position: fixed;
-        top: 0; left: 0; right: 0;
+        position: fixed; top: 0; left: 0; right: 0;
         z-index: 10000;
-        background: var(--background-color, #fff);
+        background: var(--background-color, #ffffff);
         border-bottom: 1px solid rgba(49,51,63,.14);
         box-shadow: 0 2px 10px rgba(0,0,0,.05);
       }
       .fixed-inner {
-        padding: .5rem .75rem;
+        padding: .55rem .9rem;
         max-width: 1200px;
         margin: 0 auto;
       }
-      .brand {
-        font-weight: 800; letter-spacing:.2px; white-space:nowrap;
-      }
-      .row {
-        display:flex; gap: .75rem; align-items:center; flex-wrap: wrap;
-      }
-      .row > .grow { flex:1 1 auto; }
-      .row > .shrink { flex:0 0 auto; }
-      /* Style compact pour les uploaders et le bouton */
+      .row { display:flex; gap:.75rem; align-items:center; flex-wrap:wrap; }
+      .row .left, .row .right { flex: 0 0 auto; display:flex; align-items:center; gap:.5rem; }
+      .row .mid { flex: 1 1 auto; display:flex; gap:.75rem; align-items:center; justify-content:center; }
+
+      /* Trois contrôles = même taille */
+      :root { --ctrl-h: 46px; }
+      .uploader, .resetbtn { min-width: 240px; flex: 1 1 0; }
+
+      /* Styliser les uploaders */
+      .fixed-header .stFileUploader { width: 100%; }
       .fixed-header .stFileUploader > div > div {
+        height: var(--ctrl-h);
+        display:flex; align-items:center;
         border-radius: 999px !important;
         border: 1px solid rgba(49,51,63,.25) !important;
-        padding: .15rem .6rem !important;
+        padding: .15rem .9rem !important;
         background: rgba(0,0,0,0.02) !important;
       }
       .fixed-header .stFileUploader label {
-        font-weight: 600 !important;
-        margin-bottom: 0 !important;
-        font-size: .9rem !important;
+        display:none;  /* on garde un look compact */
       }
       .fixed-header .stFileUploader small { display:none; }
+
+      /* Bouton Reset même hauteur & largeur */
       .fixed-header .stButton>button {
+        height: var(--ctrl-h);
+        width: 100%;
         border-radius: 999px;
         font-weight: 700;
         padding: .45rem 1rem;
       }
-      @media (max-width: 820px) {
-        .block-container { padding-top: 150px; }
+
+      /* Logos (gardez une taille raisonnable) */
+      .logo { display:flex; align-items:center; height: var(--ctrl-h); }
+      .logo img { max-height: 44px; width:auto; }
+      .logo-placeholder {
+        font-weight: 800; font-size: 1.0rem; letter-spacing:.2px; white-space:nowrap;
       }
     </style>
     """,
@@ -185,8 +198,7 @@ def excel_bytes(combined_df, stats_df, counts_df, methods_df) -> io.BytesIO:
                 methods_df.reset_index().to_excel(writer, index=False, sheet_name="Méthodes")
             break
         except ModuleNotFoundError:
-            buf = io.BytesIO()
-            continue
+            buf = io.BytesIO(); continue
     buf.seek(0); return buf
 
 # ======================== Optimisation (n*, Qr*, Qw*) =======================
@@ -205,7 +217,8 @@ def _get_excel_bytes(file_like) -> bytes:
     if hasattr(file_like, "getvalue"):
         try: return file_like.getvalue()
         except Exception: pass
-    try: data = file_like.read(); return data
+    try:
+        data = file_like.read(); return data
     finally:
         try: file_like.seek(0)
         except Exception: pass
@@ -310,42 +323,60 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
     return result_df, info_msgs, warn_msgs
 
 # ============================== Interface ==============================
-# --- État pour réinitialisation ---
+# État pour réinitialisation
 if "uploader_nonce" not in st.session_state:
     st.session_state["uploader_nonce"] = 0
 nonce = st.session_state["uploader_nonce"]
 
-# ---------- BARRE FIXE TOUT EN HAUT ----------
+# ---------- BARRE FIXE tout en haut (logos + 2 uploaders + reset) ----------
 st.markdown('<div class="fixed-header"><div class="fixed-inner">', unsafe_allow_html=True)
 
-# Ligne: marque à gauche, téléverseurs au centre, reset à droite
-colA, colB, colC, colD = st.columns([1.6, 3.1, 3.1, 1.2])
-with colA:
-    st.markdown('<div class="brand">📊 DEMANDE • ANALYSE</div>', unsafe_allow_html=True)
-with colB:
+# build the row layout
+colL, colU1, colU2, colR = st.columns([1.0, 3.0, 3.0, 1.0])
+
+with colL:
+    st.markdown('<div class="row left">', unsafe_allow_html=True)
+    try:
+        st.image(DELiCE_LOGO_PATH, width=90)
+    except Exception:
+        st.markdown('<div class="logo"><span class="logo-placeholder">Délice</span></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with colU1:
+    st.markdown('<div class="row mid uploader">', unsafe_allow_html=True)
     uploaded = st.file_uploader(
         "Classeur **classification**",
         type=["xlsx", "xls"],
         key=f"clf_{nonce}",
         help="Feuille choisie = table large Produit × Périodes."
     )
-with colC:
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with colU2:
+    st.markdown('<div class="row mid uploader">', unsafe_allow_html=True)
     uploaded_opt = st.file_uploader(
         "Classeur **optimisation** (optionnel)",
         type=["xlsx", "xls"],
         key=f"opt_{nonce}",
         help="Contient 'consommation depots externe' + feuilles 'time serie *'."
     )
-with colD:
-    if st.button("🔄 Réinitialiser", use_container_width=True,
-                 help="Efface les fichiers téléversés et la sélection actuelle."):
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with colR:
+    st.markdown('<div class="row right">', unsafe_allow_html=True)
+    if st.button("🔄 Réinitialiser", key=f"reset_{nonce}", help="Efface les fichiers et la sélection.", use_container_width=True):
         st.session_state["uploader_nonce"] += 1
         for k in ["selected_product"]:
             st.session_state.pop(k, None)
         st.rerun()
+    try:
+        st.image(POLYTECH_LOGO_PATH, width=44)
+    except Exception:
+        st.markdown('<div class="logo"><span class="logo-placeholder">PI</span></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown('</div></div>', unsafe_allow_html=True)
-# ---------- FIN BARRE FIXE ----------
+# ----------------------------- FIN BARRE FIXE -----------------------------
 
 st.title("Classification minimale — taille/fréquence → CV² & p → méthode")
 
@@ -360,12 +391,19 @@ if uploaded is not None:
     except Exception as e:
         st.error(f"Impossible de lire le classeur : {e}")
 
+def choose_method(p: float, cv2: float) -> Tuple[str, str]:
+    if pd.isna(p) or pd.isna(cv2): return "Données insuffisantes", ""
+    if p <= 0: return "Aucune demande", ""
+    if p >= P_CUTOFF and cv2 <= CV2_CUTOFF: return "Régulier", "SES"
+    if p >= P_CUTOFF and cv2 > CV2_CUTOFF: return "Erratique", "SES"
+    if p < P_CUTOFF and cv2 <= CV2_CUTOFF: return "Intermittent", "Croston / SBA"
+    return "Lumpy", "SBA"
+
 def compute_and_show(uploaded, sheet_name, uploaded_opt):
     if uploaded is None or sheet_name is None:
         return
     df_raw = pd.read_excel(uploaded, sheet_name=sheet_name)
 
-    # Sélecteur de produit
     col_produit = df_raw.columns[0]
     produits = sorted(df_raw[col_produit].astype(str).dropna().unique().tolist())
     if not produits:
@@ -393,8 +431,7 @@ def compute_and_show(uploaded, sheet_name, uploaded_opt):
         if mask_taille.any():
             idx = combined_df.index[mask_taille][0]
             rows = [idx]
-            if idx + 1 in combined_df.index:
-                rows.append(idx + 1)
+            if idx + 1 in combined_df.index: rows.append(idx + 1)
             comb_sel = combined_df.loc[rows]
     st.dataframe(comb_sel if not comb_sel.empty else pd.DataFrame(), use_container_width=True)
 
@@ -408,7 +445,6 @@ def compute_and_show(uploaded, sheet_name, uploaded_opt):
     st.markdown("**Méthode par produit (sélection)**")
     st.dataframe(methods_one.reset_index(), use_container_width=True)
 
-    # Optimisation
     st.markdown("**Optimisation — n\\*, Qr\\*, Qw\\* (sélection)**")
     opt_source = uploaded_opt or uploaded
     st.caption("Classeur utilisé : " + ("optimisation séparé" if uploaded_opt is not None else "classification"))
@@ -425,7 +461,6 @@ def compute_and_show(uploaded, sheet_name, uploaded_opt):
     else:
         st.dataframe(opt_one, use_container_width=True)
 
-    # Téléchargements
     xbuf = excel_bytes(combined_df, stats_df, counts_df, methods_df)
     st.download_button("Télécharger TOUS les résultats (Excel)", data=xbuf,
                        file_name="resultats_classification.xlsx",
