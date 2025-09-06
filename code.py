@@ -14,31 +14,70 @@ CV2_CUTOFF = 0.49
 
 st.set_page_config(page_title="Classification de la demande — p & CV²", layout="wide")
 
-# ======================== Styles (en-tête collant) ==========================
+# ======================== Styles (header NAV collant) =======================
 st.markdown(
     """
     <style>
-      .sticky-header {
+      /* wrapper sticky (2 barres) */
+      .sticky-wrap {
         position: sticky;
         top: 0;
-        z-index: 9999;
-        background: rgba(255,255,255,0.98);
-        -webkit-backdrop-filter: blur(6px);
-        backdrop-filter: blur(6px);
-        border-bottom: 1px solid rgba(49,51,63,0.2);
-        padding: 0.5rem 0.5rem 0.75rem 0.5rem;
+        z-index: 10000;
       }
-      @media (prefers-color-scheme: dark) {
-        .sticky-header { background: rgba(13,17,23,0.9); border-bottom-color: rgba(255,255,255,0.12); }
+
+      /* barre supérieure rouge */
+      .topbar {
+        background: #c81d25; /* rouge */
+        color: white;
+        padding: .25rem .75rem;
+        font-size: 0.9rem;
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 1rem;
       }
-      .sticky-header .stButton>button {
-        font-weight: 600;
-        border-radius: 10px;
+      .topbar .lang { display:flex; gap:.5rem; align-items:center; }
+
+      /* barre blanche de navigation */
+      .navbar {
+        background: var(--background-color, #ffffff);
+        border-bottom: 1px solid rgba(49,51,63,.14);
+        padding: .45rem .75rem;
+        display: flex;
+        align-items: center;
+        gap: 1rem;
       }
-      .sticky-header .stFileUploader>div>div {
-        border-radius: 10px;
+      .brand {
+        font-weight: 800;
+        font-size: 1.05rem;
+        letter-spacing: .2px;
+        white-space: nowrap;
       }
-      .tight { margin-bottom: 0.35rem; }
+      .nav-spacer { flex: 1 1 auto; }
+
+      /* peaufinage des widgets streamlit dans la navbar */
+      .navbar .stFileUploader > div > div {
+        border-radius: 999px !important;
+        border: 1px solid rgba(49,51,63,.25) !important;
+        padding: .15rem .6rem !important;
+        background: rgba(0,0,0,0.02) !important;
+      }
+      .navbar .stFileUploader label {
+        font-weight: 600 !important;
+        margin-bottom: 0 !important;
+        font-size: .9rem !important;
+      }
+      .navbar .stFileUploader small { display:none; } /* cache l'aide "drag drop" */
+      .navbar .stButton>button {
+        border-radius: 999px;
+        font-weight: 700;
+        padding: .4rem .9rem;
+      }
+      /* compacte les colonnes */
+      .navbar .block-container { padding-top: 0 !important; }
+
+      /* évite que le contenu passe sous le sticky sur mobiles */
+      .stApp header { background: transparent; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -326,31 +365,45 @@ if "uploader_nonce" not in st.session_state:
     st.session_state["uploader_nonce"] = 0
 nonce = st.session_state["uploader_nonce"]
 
-# ---------- En-tête collant (téléverseurs + reset) ----------
-st.markdown('<div class="sticky-header">', unsafe_allow_html=True)
-c1, c2, c3 = st.columns([3, 3, 1.2])
-with c1:
+# ---------- EN-TÊTE COLLANT : topbar + navbar avec widgets ----------
+st.markdown('<div class="sticky-wrap">', unsafe_allow_html=True)
+
+# Topbar rouge (FR/EN déco — l’app reste FR)
+coltb1, coltb2 = st.columns([6, 4])
+with coltb2:
+    st.markdown(
+        '<div class="topbar"><div class="lang">🇫🇷 FR &nbsp;|&nbsp; 🇬🇧 EN</div></div>',
+        unsafe_allow_html=True
+    )
+# Navbar blanche : brand + uploaders + reset
+col1, col2, col3, col4 = st.columns([2.2, 3.1, 3.1, 1.2])
+with col1:
+    st.markdown('<div class="navbar"><div class="brand">📊 DEMANDE • ANALYSE</div></div>', unsafe_allow_html=True)
+# On ouvre une nouvelle rangée pour placer les widgets *dans* la navbar visuelle
+st.markdown('<div class="navbar">', unsafe_allow_html=True)
+cA, cB, cSpacer, cC = st.columns([3.2, 3.2, 1.0, 1.3])
+with cA:
     uploaded = st.file_uploader(
-        "Classeur de **classification** (.xlsx/.xls)\nColonne 1 = Produit, colonnes 2..N = périodes avec quantités.",
+        "Classeur **classification**",
         type=["xlsx", "xls"],
         key=f"clf_{nonce}",
-        help="Sélectionnez le fichier contenant la table large Produit × Périodes."
+        help="Feuille choisie = table large Produit × Périodes."
     )
-with c2:
+with cB:
     uploaded_opt = st.file_uploader(
-        "Classeur d’**optimisation** (.xlsx/.xls) — optionnel",
+        "Classeur **optimisation** (optionnel)",
         type=["xlsx", "xls"],
         key=f"opt_{nonce}",
-        help="Fichier contenant la feuille 'consommation depots externe' et les feuilles 'time serie *'."
+        help="Contient 'consommation depots externe' + feuilles 'time serie *'."
     )
-with c3:
-    st.markdown("&nbsp;", unsafe_allow_html=True)
-    if st.button("🔄 Réinitialiser", use_container_width=True, help="Efface les fichiers et la sélection actuelle."):
+with cC:
+    if st.button("🔄 Réinitialiser", use_container_width=True, help="Efface les fichiers et la sélection."):
         st.session_state["uploader_nonce"] += 1
         for k in ["selected_product"]:
             st.session_state.pop(k, None)
         st.rerun()
-st.markdown('</div>', unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)  # fin navbar
+st.markdown('</div>', unsafe_allow_html=True)  # fin sticky-wrap
 
 # ---------- Sélection de feuille & calculs ----------
 sheet_name = None
@@ -363,92 +416,97 @@ if uploaded is not None:
     except Exception as e:
         st.error(f"Impossible de lire le classeur : {e}")
 
+def compute_and_show(uploaded, sheet_name, uploaded_opt):
+    if uploaded is None or sheet_name is None:
+        return
+    df_raw = pd.read_excel(uploaded, sheet_name=sheet_name)
+
+    # Sélecteur de produit
+    col_produit = df_raw.columns[0]
+    produits = sorted(df_raw[col_produit].astype(str).dropna().unique().tolist())
+    if not produits:
+        st.warning("Aucun produit trouvé dans la première colonne.")
+        return
+    produit_sel = st.selectbox("Choisir un produit", options=produits, key="selected_product")
+
+    combined_df, stats_df, counts_df, methods_df = compute_everything(df_raw)
+
+    stats_one = stats_df.loc[[produit_sel]] if produit_sel in stats_df.index else stats_df.iloc[0:0]
+    counts_one = counts_df.loc[[produit_sel]] if produit_sel in counts_df.index else counts_df.iloc[0:0]
+    methods_one = methods_df.loc[[produit_sel]] if produit_sel in methods_df.index else methods_df.iloc[0:0]
+
+    cA, cB = st.columns(2)
+    with cA:
+        st.markdown("**Tableau 1 — moyenne / écart-type / CV² (sélection)**")
+        st.dataframe(stats_one.reset_index(), use_container_width=True)
+    with cB:
+        st.markdown("**Tableau 2 — N périodes / N fréquences / p (sélection)**")
+        st.dataframe(counts_one.reset_index(), use_container_width=True)
+
+    st.markdown("**Combiné — taille / frequence (sélection)**")
+    comb_sel = pd.DataFrame()
+    if not combined_df.empty:
+        mask_taille = (combined_df["Produit"] == produit_sel) & (combined_df["Type"] == "taille")
+        if mask_taille.any():
+            idx = combined_df.index[mask_taille][0]
+            rows = [idx]
+            if idx + 1 in combined_df.index:
+                rows.append(idx + 1)
+            comb_sel = combined_df.loc[rows]
+    st.dataframe(comb_sel if not comb_sel.empty else pd.DataFrame(), use_container_width=True)
+
+    st.markdown("**Graphe — p vs CV² avec seuils (sélection)**")
+    if not methods_one.empty:
+        fig = make_plot(methods_one)
+        st.pyplot(fig, use_container_width=True)
+    else:
+        st.info("Pas de graphe pour ce produit.")
+
+    st.markdown("**Méthode par produit (sélection)**")
+    st.dataframe(methods_one.reset_index(), use_container_width=True)
+
+    # ---- Optimisation (n*, Qr*, Qw*) ----
+    st.markdown("**Optimisation — n\\*, Qr\\*, Qw\\* (sélection)**")
+    opt_source = uploaded_opt or uploaded
+    st.caption("Classeur utilisé : " + ("optimisation séparé" if uploaded_opt is not None else "classification"))
+    opt_df, info_msgs, warn_msgs = compute_qr_qw_from_workbook(opt_source)
+    for msg in info_msgs: st.info(msg)
+    for msg in warn_msgs: st.warning(msg)
+
+    import re as _re
+    m = _re.search(r"\b[A-Z]{2}\d{4}\b", str(produit_sel))
+    opt_key = m.group(0) if m else str(produit_sel)
+    opt_one = opt_df[opt_df["Code Produit"].astype(str) == opt_key]
+    if opt_one.empty:
+        st.info(f"Aucune ligne d’optimisation pour **{produit_sel}** (code recherché : '{opt_key}').")
+    else:
+        st.dataframe(opt_one, use_container_width=True)
+
+    # Téléchargements
+    xbuf = excel_bytes(combined_df, stats_df, counts_df, methods_df)
+    st.download_button("Télécharger TOUS les résultats (Excel)", data=xbuf,
+                       file_name="resultats_classification.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    if not methods_one.empty:
+        pbuf = io.BytesIO()
+        fig.savefig(pbuf, format="png", bbox_inches="tight")
+        pbuf.seek(0)
+        st.download_button("Télécharger le graphe du produit (PNG)", data=pbuf,
+                           file_name=f"classification_{opt_key or 'produit'}.png",
+                           mime="image/png")
+
+    if not opt_df.empty:
+        st.download_button(
+            "Télécharger TOUTES les optimisations (CSV)",
+            data=opt_df.to_csv(index=False).encode("utf-8"),
+            file_name="optimisation_qr_qw.csv",
+            mime="text/csv"
+        )
+
 if uploaded is not None and sheet_name is not None:
     try:
-        df_raw = pd.read_excel(uploaded, sheet_name=sheet_name)
-
-        # Sélecteur de produit
-        col_produit = df_raw.columns[0]
-        produits = sorted(df_raw[col_produit].astype(str).dropna().unique().tolist())
-        if not produits:
-            st.warning("Aucun produit trouvé dans la première colonne.")
-        produit_sel = st.selectbox("Choisir un produit", options=produits, key="selected_product")
-
-        combined_df, stats_df, counts_df, methods_df = compute_everything(df_raw)
-
-        stats_one = stats_df.loc[[produit_sel]] if produit_sel in stats_df.index else stats_df.iloc[0:0]
-        counts_one = counts_df.loc[[produit_sel]] if produit_sel in counts_df.index else counts_df.iloc[0:0]
-        methods_one = methods_df.loc[[produit_sel]] if produit_sel in methods_df.index else methods_df.iloc[0:0]
-
-        cA, cB = st.columns(2)
-        with cA:
-            st.markdown("**Tableau 1 — moyenne / écart-type / CV² (sélection)**")
-            st.dataframe(stats_one.reset_index(), use_container_width=True)
-        with cB:
-            st.markdown("**Tableau 2 — N périodes / N fréquences / p (sélection)**")
-            st.dataframe(counts_one.reset_index(), use_container_width=True)
-
-        st.markdown("**Combiné — taille / frequence (sélection)**")
-        comb_sel = pd.DataFrame()
-        if not combined_df.empty:
-            mask_taille = (combined_df["Produit"] == produit_sel) & (combined_df["Type"] == "taille")
-            if mask_taille.any():
-                idx = combined_df.index[mask_taille][0]
-                rows = [idx]
-                if idx + 1 in combined_df.index:
-                    rows.append(idx + 1)
-                comb_sel = combined_df.loc[rows]
-        st.dataframe(comb_sel if not comb_sel.empty else pd.DataFrame(), use_container_width=True)
-
-        st.markdown("**Graphe — p vs CV² avec seuils (sélection)**")
-        if not methods_one.empty:
-            fig = make_plot(methods_one)
-            st.pyplot(fig, use_container_width=True)
-        else:
-            st.info("Pas de graphe pour ce produit.")
-
-        st.markdown("**Méthode par produit (sélection)**")
-        st.dataframe(methods_one.reset_index(), use_container_width=True)
-
-        # ---- Optimisation (n*, Qr*, Qw*) ----
-        st.markdown("**Optimisation — n\\*, Qr\\*, Qw\\* (sélection)**")
-        opt_source = uploaded_opt or uploaded
-        st.caption("Classeur utilisé : " + ("optimisation séparé" if uploaded_opt is not None else "classification"))
-        opt_df, info_msgs, warn_msgs = compute_qr_qw_from_workbook(opt_source)
-        for msg in info_msgs: st.info(msg)
-        for msg in warn_msgs: st.warning(msg)
-
-        import re as _re
-        m = _re.search(r"\b[A-Z]{2}\d{4}\b", str(produit_sel))
-        opt_key = m.group(0) if m else str(produit_sel)
-        opt_one = opt_df[opt_df["Code Produit"].astype(str) == opt_key]
-        if opt_one.empty:
-            st.info(f"Aucune ligne d’optimisation pour **{produit_sel}** (code recherché : '{opt_key}').")
-        else:
-            st.dataframe(opt_one, use_container_width=True)
-
-        # Téléchargements
-        xbuf = excel_bytes(combined_df, stats_df, counts_df, methods_df)
-        st.download_button("Télécharger TOUS les résultats (Excel)", data=xbuf,
-                           file_name="resultats_classification.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-        if not methods_one.empty:
-            pbuf = io.BytesIO()
-            fig.savefig(pbuf, format="png", bbox_inches="tight")
-            pbuf.seek(0)
-            st.download_button("Télécharger le graphe du produit (PNG)", data=pbuf,
-                               file_name=f"classification_{opt_key or 'produit'}.png",
-                               mime="image/png")
-
-        if not opt_df.empty:
-            st.download_button(
-                "Télécharger TOUTES les optimisations (CSV)",
-                data=opt_df.to_csv(index=False).encode("utf-8"),
-                file_name="optimisation_qr_qw.csv",
-                mime="text/csv"
-            )
-
+        compute_and_show(uploaded, sheet_name, uploaded_opt)
     except Exception as e:
         st.error(f"Échec du traitement : {e}")
 else:
