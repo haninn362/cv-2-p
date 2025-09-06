@@ -1,5 +1,7 @@
+# app.py
 import io
 import re
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
@@ -7,11 +9,25 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# ------------ Config logos (place the files next to app.py) ---------------
-DELiCE_LOGO_PATH = "delice_logo.png"     # <- use your Délice image
-POLYTECH_LOGO_PATH = "polytech_logo.png" # <- use your Polytech image
+# -------------------- Chemins logos (utilise vos noms exacts) --------------------
+APP_DIR = Path(__file__).parent
+ASSETS = APP_DIR / "assets"
+ASSETS.mkdir(exist_ok=True)
 
-# --- Seuils Syntetos & Boylan ---
+DELICE_LOGO_PATH = ASSETS / "5751b545-5000-44a9-aa6c-5f2c02b75db1.png"      # gauche
+POLYTECH_LOGO_PATH = ASSETS / "90dbbfef-3449-4cf4-82b1-e5246a1d65d9.png"    # droite
+
+# Fallback si quelqu'un les met à la racine par erreur
+if not DELICE_LOGO_PATH.exists():
+    alt = APP_DIR / DELICE_LOGO_PATH.name
+    if alt.exists():
+        DELICE_LOGO_PATH = alt
+if not POLYTECH_LOGO_PATH.exists():
+    alt = APP_DIR / POLYTECH_LOGO_PATH.name
+    if alt.exists():
+        POLYTECH_LOGO_PATH = alt
+
+# --------------------- Seuils Syntetos & Boylan ---------------------
 ADI_CUTOFF = 1.32
 P_CUTOFF = 1.0 / ADI_CUTOFF       # ≈ 0,757576
 CV2_CUTOFF = 0.49
@@ -22,10 +38,10 @@ st.set_page_config(page_title="Classification de la demande — p & CV²", layou
 st.markdown(
     """
     <style>
-      /* Masquer l’entête Streamlit par défaut */
+      /* Masquer l’en-tête Streamlit par défaut */
       header[data-testid="stHeader"] { display: none; }
 
-      /* Laisser la place sous la barre fixe (ajustée responsive) */
+      /* Laisser de la place sous la barre fixe (responsive) */
       .block-container { padding-top: 128px; }
       @media (max-width: 880px) { .block-container { padding-top: 160px; } }
 
@@ -46,11 +62,11 @@ st.markdown(
       .row .left, .row .right { flex: 0 0 auto; display:flex; align-items:center; gap:.5rem; }
       .row .mid { flex: 1 1 auto; display:flex; gap:.75rem; align-items:center; justify-content:center; }
 
-      /* Trois contrôles = même taille */
+      /* Trois contrôles = même taille (2 uploaders + reset) */
       :root { --ctrl-h: 46px; }
       .uploader, .resetbtn { min-width: 240px; flex: 1 1 0; }
 
-      /* Styliser les uploaders */
+      /* Uploaders compacts et arrondis */
       .fixed-header .stFileUploader { width: 100%; }
       .fixed-header .stFileUploader > div > div {
         height: var(--ctrl-h);
@@ -60,12 +76,10 @@ st.markdown(
         padding: .15rem .9rem !important;
         background: rgba(0,0,0,0.02) !important;
       }
-      .fixed-header .stFileUploader label {
-        display:none;  /* on garde un look compact */
-      }
+      .fixed-header .stFileUploader label { display:none; }
       .fixed-header .stFileUploader small { display:none; }
 
-      /* Bouton Reset même hauteur & largeur */
+      /* Bouton Reset même hauteur/largeur */
       .fixed-header .stButton>button {
         height: var(--ctrl-h);
         width: 100%;
@@ -74,12 +88,10 @@ st.markdown(
         padding: .45rem 1rem;
       }
 
-      /* Logos (gardez une taille raisonnable) */
+      /* Logos */
       .logo { display:flex; align-items:center; height: var(--ctrl-h); }
       .logo img { max-height: 44px; width:auto; }
-      .logo-placeholder {
-        font-weight: 800; font-size: 1.0rem; letter-spacing:.2px; white-space:nowrap;
-      }
+      .logo-miss { color: #c81d25; font-weight:600; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -87,6 +99,7 @@ st.markdown(
 
 # ============================ Logique principale ============================
 def choose_method(p: float, cv2: float) -> Tuple[str, str]:
+    """Retourne (Catégorie, Méthode suggérée)."""
     if pd.isna(p) or pd.isna(cv2):
         return "Données insuffisantes", ""
     if p <= 0:
@@ -100,6 +113,10 @@ def choose_method(p: float, cv2: float) -> Tuple[str, str]:
     return "Lumpy", "SBA"
 
 def compute_everything(df: pd.DataFrame):
+    """
+    df : 1re colonne = produit, colonnes 2..N = dates/périodes avec quantités.
+    Renvoie : combined_df, stats_df, counts_df, methods_df
+    """
     date_cols = list(df.columns[1:])
     parsed_dates = pd.to_datetime(date_cols, errors="coerce")
     n_periods = int(parsed_dates.notna().sum()) or len(date_cols)
@@ -166,14 +183,17 @@ def compute_everything(df: pd.DataFrame):
     return combined_df, stats_df, counts_df, methods_df
 
 def make_plot(methods_df: pd.DataFrame):
+    """Figure Matplotlib : p (x) vs CV² (y), avec lignes de seuil."""
     fig, ax = plt.subplots(figsize=(8, 6))
     x = methods_df["p"].clip(lower=0, upper=1)
     y = methods_df["CV^2"]
+
     ax.scatter(x, y)
     for label, xi, yi in zip(methods_df.index, x, y):
         if pd.notna(xi) and pd.notna(yi):
             ax.annotate(f"{label} (p={xi:.3f}, CV²={yi:.3f})",
                         (xi, yi), textcoords="offset points", xytext=(5, 5))
+
     ax.axvline(P_CUTOFF, linestyle="--")
     ax.axhline(CV2_CUTOFF, linestyle="--")
     ax.set_xlabel("p (part des périodes non nulles)")
@@ -184,6 +204,7 @@ def make_plot(methods_df: pd.DataFrame):
     return fig
 
 def excel_bytes(combined_df, stats_df, counts_df, methods_df) -> io.BytesIO:
+    """Crée un Excel : Tableau 1, Tableau 2, Combiné, Méthodes."""
     buf = io.BytesIO()
     for engine in ("openpyxl", "xlsxwriter", None):
         try:
@@ -198,8 +219,10 @@ def excel_bytes(combined_df, stats_df, counts_df, methods_df) -> io.BytesIO:
                 methods_df.reset_index().to_excel(writer, index=False, sheet_name="Méthodes")
             break
         except ModuleNotFoundError:
-            buf = io.BytesIO(); continue
-    buf.seek(0); return buf
+            buf = io.BytesIO()
+            continue
+    buf.seek(0)
+    return buf
 
 # ======================== Optimisation (n*, Qr*, Qw*) =======================
 def _norm(s: str) -> str:
@@ -208,26 +231,36 @@ def _norm(s: str) -> str:
 def _find_first_col(df: pd.DataFrame, starts_with: str = None, contains: str = None):
     for c in df.columns:
         cn = _norm(c)
-        if starts_with and cn.startswith(starts_with): return c
-        if contains and contains in cn: return c
+        if starts_with and cn.startswith(starts_with):
+            return c
+        if contains and contains in cn:
+            return c
     return None
 
 def _get_excel_bytes(file_like) -> bytes:
-    if file_like is None: return b""
+    if file_like is None:
+        return b""
     if hasattr(file_like, "getvalue"):
-        try: return file_like.getvalue()
-        except Exception: pass
+        try:
+            return file_like.getvalue()
+        except Exception:
+            pass
     try:
-        data = file_like.read(); return data
+        data = file_like.read()
+        return data
     finally:
-        try: file_like.seek(0)
-        except Exception: pass
+        try:
+            file_like.seek(0)
+        except Exception:
+            pass
 
 def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation depots externe",
                                 time_series_prefix: str = "time seri"):
+    """Lit le classeur et calcule n*, Qr*, Qw* pour chaque feuille 'time serie*' ou 'time series*'."""
     info_msgs, warn_msgs = [], []
     if file_like is None:
         return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
+
     data_bytes = _get_excel_bytes(file_like)
     if not data_bytes:
         warn_msgs.append("Classeur d’optimisation vide ou illisible.")
@@ -235,30 +268,39 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
 
     xls = pd.ExcelFile(io.BytesIO(data_bytes))
 
+    # Feuille consommation
     sheet_names_norm = {_norm(s): s for s in xls.sheet_names}
     conso_sheet = sheet_names_norm.get(_norm(conso_sheet_hint))
     if not conso_sheet:
         cands = [s for s in xls.sheet_names if _norm(conso_sheet_hint) in _norm(s)]
-        if cands: conso_sheet = cands[0]
+        if cands:
+            conso_sheet = cands[0]
     if not conso_sheet:
         warn_msgs.append("Feuille 'consommation depots externe' introuvable.")
         return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
 
     df_conso = pd.read_excel(io.BytesIO(data_bytes), sheet_name=conso_sheet)
 
+    # Préférence forte pour 'Quantite STIAL'
     code_col = next((c for c in df_conso.columns if "code produit" in _norm(c)), None) or "Code Produit"
     qty_col = None
     for c in df_conso.columns:
         nc = _norm(c)
-        if nc == "quantite stial" or nc == "quantité stial": qty_col = c; break
+        if nc == "quantite stial" or nc == "quantité stial":
+            qty_col = c
+            break
     if qty_col is None:
         for c in df_conso.columns:
             nc = _norm(c)
-            if "quantite stial" in nc or "quantité stial" in nc: qty_col = c; break
+            if "quantite stial" in nc or "quantité stial" in nc:
+                qty_col = c
+                break
     if qty_col is None:
         for key in ["quantite", "quantité", "qte"]:
             cand = next((c for c in df_conso.columns if key in _norm(c)), None)
-            if cand: qty_col = cand; break
+            if cand:
+                qty_col = cand
+                break
 
     if code_col is None or qty_col is None:
         warn_msgs.append("Colonnes 'Code Produit' et/ou 'Quantite STIAL' introuvables.")
@@ -268,6 +310,7 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
     info_msgs.append(f"Feuille de consommation : '{conso_sheet}' (lignes : {len(df_conso)})")
     info_msgs.append(f"Colonne quantité utilisée : '{qty_col}'")
 
+    # Feuilles time serie*
     ts_sheets = [s for s in xls.sheet_names if _norm(s).startswith(_norm(time_series_prefix))]
     if not ts_sheets:
         warn_msgs.append("Aucune feuille 'time serie*' trouvée (ex. 'time serie EM0400').")
@@ -278,19 +321,22 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
         try:
             df = pd.read_excel(io.BytesIO(data_bytes), sheet_name=sheet)
             code_produit = sheet.split()[-1]
+
             cr_col = _find_first_col(df, starts_with="cr")
             cw_col = _find_first_col(df, starts_with="cw")
             aw_col = _find_first_col(df, starts_with="aw")
             ar_col = _find_first_col(df, starts_with="ar")
             if not all([cr_col, cw_col, aw_col, ar_col]):
-                warn_msgs.append(f"[{sheet}] Paramètres CR/CW/AW/AR manquants — ignoré."); continue
+                warn_msgs.append(f"[{sheet}] Paramètres CR/CW/AW/AR manquants — ignoré.")
+                continue
 
             C_r = pd.to_numeric(df[cr_col].iloc[0], errors="coerce")
             C_w = pd.to_numeric(df[cw_col].iloc[0], errors="coerce")
             A_w = pd.to_numeric(df[aw_col].iloc[0], errors="coerce")
             A_r = pd.to_numeric(df[ar_col].iloc[0], errors="coerce")
             if any(pd.isna(v) for v in [C_r, C_w, A_w, A_r]) or any(v == 0 for v in [C_w, A_r]):
-                warn_msgs.append(f"[{sheet}] Valeurs de paramètres invalides — ignoré."); continue
+                warn_msgs.append(f"[{sheet}] Valeurs de paramètres invalides — ignoré.")
+                continue
 
             n = (A_w * C_r) / (A_r * C_w)
             n = 1 if n < 1 else round(n)
@@ -303,7 +349,8 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
             tau = 1
             denom = (n_star * C_w + C_r * tau)
             if denom <= 0:
-                warn_msgs.append(f"[{sheet}] Dénominateur non positif pour Q* — ignoré."); continue
+                warn_msgs.append(f"[{sheet}] Dénominateur non positif pour Q* — ignoré.")
+                continue
 
             if D is None or D <= 0:
                 warn_msgs.append(f"[{sheet}] Demande non positive D={D} → Q*=0.")
@@ -312,8 +359,12 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
                 Q_r_star = ((2 * (A_r + A_w / n_star) * D) / denom) ** 0.5
 
             Q_w_star = n_star * Q_r_star
-            rows.append({"Code Produit": str(code_produit), "n*": int(n_star),
-                         "Qr*": round(float(Q_r_star), 2), "Qw*": round(float(Q_w_star), 2)})
+            rows.append({
+                "Code Produit": str(code_produit),
+                "n*": int(n_star),
+                "Qr*": round(float(Q_r_star), 2),
+                "Qw*": round(float(Q_w_star), 2),
+            })
         except Exception as e:
             warn_msgs.append(f"[{sheet}] Échec : {e}")
 
@@ -328,18 +379,17 @@ if "uploader_nonce" not in st.session_state:
     st.session_state["uploader_nonce"] = 0
 nonce = st.session_state["uploader_nonce"]
 
-# ---------- BARRE FIXE tout en haut (logos + 2 uploaders + reset) ----------
+# ---------- BARRE FIXE (logos + 2 uploaders + reset) ----------
 st.markdown('<div class="fixed-header"><div class="fixed-inner">', unsafe_allow_html=True)
 
-# build the row layout
 colL, colU1, colU2, colR = st.columns([1.0, 3.0, 3.0, 1.0])
 
 with colL:
     st.markdown('<div class="row left">', unsafe_allow_html=True)
-    try:
-        st.image(DELiCE_LOGO_PATH, width=90)
-    except Exception:
-        st.markdown('<div class="logo"><span class="logo-placeholder">Délice</span></div>', unsafe_allow_html=True)
+    if DELICE_LOGO_PATH.exists():
+        st.image(str(DELICE_LOGO_PATH), width=90)
+    else:
+        st.caption(f'<span class="logo-miss">Logo Délice manquant</span>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 with colU1:
@@ -358,7 +408,7 @@ with colU2:
         "Classeur **optimisation** (optionnel)",
         type=["xlsx", "xls"],
         key=f"opt_{nonce}",
-        help="Contient 'consommation depots externe' + feuilles 'time serie *'."
+        help="Inclut 'consommation depots externe' + feuilles 'time serie *'."
     )
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -369,10 +419,10 @@ with colR:
         for k in ["selected_product"]:
             st.session_state.pop(k, None)
         st.rerun()
-    try:
-        st.image(POLYTECH_LOGO_PATH, width=44)
-    except Exception:
-        st.markdown('<div class="logo"><span class="logo-placeholder">PI</span></div>', unsafe_allow_html=True)
+    if POLYTECH_LOGO_PATH.exists():
+        st.image(str(POLYTECH_LOGO_PATH), width=44)
+    else:
+        st.caption(f'<span class="logo-miss">Logo PI manquant</span>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown('</div></div>', unsafe_allow_html=True)
@@ -391,23 +441,17 @@ if uploaded is not None:
     except Exception as e:
         st.error(f"Impossible de lire le classeur : {e}")
 
-def choose_method(p: float, cv2: float) -> Tuple[str, str]:
-    if pd.isna(p) or pd.isna(cv2): return "Données insuffisantes", ""
-    if p <= 0: return "Aucune demande", ""
-    if p >= P_CUTOFF and cv2 <= CV2_CUTOFF: return "Régulier", "SES"
-    if p >= P_CUTOFF and cv2 > CV2_CUTOFF: return "Erratique", "SES"
-    if p < P_CUTOFF and cv2 <= CV2_CUTOFF: return "Intermittent", "Croston / SBA"
-    return "Lumpy", "SBA"
-
 def compute_and_show(uploaded, sheet_name, uploaded_opt):
     if uploaded is None or sheet_name is None:
         return
     df_raw = pd.read_excel(uploaded, sheet_name=sheet_name)
 
+    # Sélecteur de produit
     col_produit = df_raw.columns[0]
     produits = sorted(df_raw[col_produit].astype(str).dropna().unique().tolist())
     if not produits:
-        st.warning("Aucun produit trouvé dans la première colonne."); return
+        st.warning("Aucun produit trouvé dans la première colonne.")
+        return
     produit_sel = st.selectbox("Choisir un produit", options=produits, key="selected_product")
 
     combined_df, stats_df, counts_df, methods_df = compute_everything(df_raw)
@@ -431,7 +475,8 @@ def compute_and_show(uploaded, sheet_name, uploaded_opt):
         if mask_taille.any():
             idx = combined_df.index[mask_taille][0]
             rows = [idx]
-            if idx + 1 in combined_df.index: rows.append(idx + 1)
+            if idx + 1 in combined_df.index:
+                rows.append(idx + 1)
             comb_sel = combined_df.loc[rows]
     st.dataframe(comb_sel if not comb_sel.empty else pd.DataFrame(), use_container_width=True)
 
@@ -445,15 +490,18 @@ def compute_and_show(uploaded, sheet_name, uploaded_opt):
     st.markdown("**Méthode par produit (sélection)**")
     st.dataframe(methods_one.reset_index(), use_container_width=True)
 
+    # Optimisation
     st.markdown("**Optimisation — n\\*, Qr\\*, Qw\\* (sélection)**")
     opt_source = uploaded_opt or uploaded
     st.caption("Classeur utilisé : " + ("optimisation séparé" if uploaded_opt is not None else "classification"))
     opt_df, info_msgs, warn_msgs = compute_qr_qw_from_workbook(opt_source)
-    for msg in info_msgs: st.info(msg)
-    for msg in warn_msgs: st.warning(msg)
+    for msg in info_msgs:
+        st.info(msg)
+    for msg in warn_msgs:
+        st.warning(msg)
 
-    import re as _re
-    m = _re.search(r"\b[A-Z]{2}\d{4}\b", str(produit_sel))
+    # Essayer d’extraire un code comme EM0400 depuis le libellé
+    m = re.search(r"\b[A-Z]{2}\d{4}\b", str(produit_sel))
     opt_key = m.group(0) if m else str(produit_sel)
     opt_one = opt_df[opt_df["Code Produit"].astype(str) == opt_key]
     if opt_one.empty:
@@ -461,6 +509,7 @@ def compute_and_show(uploaded, sheet_name, uploaded_opt):
     else:
         st.dataframe(opt_one, use_container_width=True)
 
+    # Téléchargements
     xbuf = excel_bytes(combined_df, stats_df, counts_df, methods_df)
     st.download_button("Télécharger TOUS les résultats (Excel)", data=xbuf,
                        file_name="resultats_classification.xlsx",
