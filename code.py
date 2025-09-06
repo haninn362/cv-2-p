@@ -156,7 +156,7 @@ def excel_bytes(combined_df, stats_df, counts_df, methods_df) -> io.BytesIO:
     return buf
 
 # =========================
-# NEW FEATURE (ADD-ONLY): n*, Qr*, Qw* optimization based on your extra code
+# NEW FEATURE (ADD-ONLY): n*, Qr*, Qw* optimization
 # =========================
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip().lower())
@@ -217,13 +217,30 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
 
     df_conso = pd.read_excel(io.BytesIO(data_bytes), sheet_name=conso_sheet)
 
-    # find code & quantity columns (tolerant to accents/newlines/extra text)
-    code_col = None
-    for key in ["code produit", "code", "produit"]:
-        code_col = next((c for c in df_conso.columns if key in _norm(c)), None) or code_col
+    # --- find code & quantity columns (prefer 'Quantite STIAL')
+    code_col = next((c for c in df_conso.columns if "code produit" in _norm(c)), None) or "Code Produit"
+
     qty_col = None
-    for key in ["quantite stial", "quantité stial", "quantite", "quantité", "qte"]:
-        qty_col = next((c for c in df_conso.columns if key in _norm(c)), None) or qty_col
+    # 1) exact preferred matches
+    for c in df_conso.columns:
+        nc = _norm(c)
+        if nc == "quantite stial" or nc == "quantité stial":
+            qty_col = c
+            break
+    # 2) substring preferred matches
+    if qty_col is None:
+        for c in df_conso.columns:
+            nc = _norm(c)
+            if "quantite stial" in nc or "quantité stial" in nc:
+                qty_col = c
+                break
+    # 3) generic fallbacks (first match wins)
+    if qty_col is None:
+        for key in ["quantite", "quantité", "qte"]:
+            cand = next((c for c in df_conso.columns if key in _norm(c)), None)
+            if cand:
+                qty_col = cand
+                break
 
     if code_col is None or qty_col is None:
         warn_msgs.append("Could not locate 'Code Produit' and/or 'Quantite STIAL' columns in the consumption sheet.")
@@ -231,6 +248,7 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
 
     conso_series = df_conso.groupby(code_col, dropna=False)[qty_col].sum(numeric_only=True)
     info_msgs.append(f"Consumption sheet: '{conso_sheet}' (rows: {len(df_conso)})")
+    info_msgs.append(f"Quantity column used: '{qty_col}'")
 
     # --- detect 'time serie*' or 'time series*' sheets
     ts_sheets = [s for s in xls.sheet_names if _norm(s).startswith(_norm(time_series_prefix))]
@@ -274,6 +292,8 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
 
             # demand D from consumption totals
             D = conso_series.get(product_code, 0)
+            if D is None:
+                D = 0
             tau = 1  # as per your script
 
             denom = (n_star * C_w + C_r * tau)
@@ -281,7 +301,12 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
                 warn_msgs.append(f"[{sheet}] Non-positive denominator for Q*; skipped.")
                 continue
 
-            Q_r_star = ((2 * (A_r + A_w / n_star) * D) / denom) ** 0.5 if D > 0 else 0.0
+            if D <= 0:
+                warn_msgs.append(f"[{sheet}] Non-positive demand D={D} from '{qty_col}' → set Q*=0.")
+                Q_r_star = 0.0
+            else:
+                Q_r_star = ((2 * (A_r + A_w / n_star) * D) / denom) ** 0.5
+
             Q_w_star = n_star * Q_r_star
 
             results.append({
