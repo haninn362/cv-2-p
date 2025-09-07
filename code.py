@@ -1,7 +1,6 @@
 # app.py
 import io
 import re
-from pathlib import Path
 from typing import Tuple, List
 
 import numpy as np
@@ -30,7 +29,7 @@ st.markdown(
       /* Masquer l’en-tête Streamlit */
       header[data-testid="stHeader"] { display: none; }
 
-      /* Laisser de la place sous la barre fixe (1 rangée) */
+      /* Laisser de la place sous la barre fixe */
       .block-container { padding-top: 120px; }
       @media (max-width: 880px) { .block-container { padding-top: 140px; } }
 
@@ -368,26 +367,39 @@ def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
     raise ValueError(f"Onglet pour '{code}' introuvable.")
 
 def _fc_daily_B_and_C(xls_bytes: bytes, sheet_name: str):
+    """
+    Read A(date), B(stock/receipts), C(consumption). Aggregate duplicates by day
+    before reindexing to a full daily range to avoid duplicate-index errors.
+    """
     df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet_name)
     cols = list(df.columns)
     if len(cols) < 3:
         raise ValueError(f"Feuille '{sheet_name}': colonnes insuffisantes (A,B,C).")
+
     date_col, stock_col, cons_col = cols[0], cols[1], cols[2]
-    dates = pd.to_datetime(df[date_col], errors="coerce")
+
+    dates = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
     if dates.isna().all():
         raise ValueError(f"Feuille '{sheet_name}': colonne A (dates) non valide.")
+
     stock = pd.to_numeric(df[stock_col], errors="coerce").fillna(0.0).astype(float)
     cons  = pd.to_numeric(df[cons_col],  errors="coerce").fillna(0.0).astype(float)
 
-    ts_stock = pd.DataFrame({"date": dates, "b": stock}).dropna(subset=["date"]).sort_values("date").set_index("date")["b"]
-    ts_cons  = pd.DataFrame({"date": dates, "c": cons }).dropna(subset=["date"]).sort_values("date").set_index("date")["c"]
+    g = (
+        pd.DataFrame({"date": dates, "b": stock, "c": cons})
+        .dropna(subset=["date"])
+        .groupby("date", as_index=True)[["b", "c"]]
+        .sum()
+        .sort_index()
+    )
+    if g.empty:
+        raise ValueError(f"Feuille '{sheet_name}': aucune ligne exploitable après agrégation.")
 
-    min_date = min(ts_stock.index.min(), ts_cons.index.min())
-    max_date = max(ts_stock.index.max(), ts_cons.index.max())
-    full_idx = pd.date_range(min_date, max_date, freq="D")
-
-    stock_daily = ts_stock.reindex(full_idx, fill_value=0.0)
-    cons_daily  = ts_cons.reindex(full_idx,  fill_value=0.0)
+    full_idx = pd.date_range(g.index.min(), g.index.max(), freq="D")
+    stock_daily = g["b"].reindex(full_idx, fill_value=0.0)
+    cons_daily  = g["c"].reindex(full_idx, fill_value=0.0)
+    stock_daily.index.name = "date"
+    cons_daily.index.name  = "date"
     return stock_daily, cons_daily
 
 def _fc_interval_sum_next_days(daily: pd.Series, start_idx: int, interval: int) -> float:
