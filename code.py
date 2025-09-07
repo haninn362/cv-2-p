@@ -301,6 +301,23 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
     return result_df, info_msgs, warn_msgs
 
 # ======================== FORECASTING (integrated) =========================
+def _parse_num_locale(series) -> pd.Series:
+    """Robust numeric parser for '1 234,56' / '1,234.56' / '1234' / etc."""
+    s = pd.Series(series)
+    # Try direct numeric
+    v1 = pd.to_numeric(s, errors="coerce")
+    if v1.notna().mean() >= 0.60:
+        return v1.fillna(0.0).astype(float)
+    # Remove NBSP + spaces
+    s2 = (s.astype(str)
+            .str.replace("\u00A0", "", regex=False)
+            .str.replace(" ", "", regex=False))
+    # Convert European format 1.234,56 -> 1234.56
+    s2b = (s2.str.replace(".", "", regex=False)
+              .str.replace(",", ".", regex=False))
+    v2 = pd.to_numeric(s2b, errors="coerce")
+    return v2.fillna(0.0).astype(float)
+
 def _fc_list_time_serie_codes(xls: pd.ExcelFile) -> List[str]:
     codes = []
     for s in xls.sheet_names:
@@ -334,21 +351,66 @@ def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
 
 def _fc_daily_B_and_C(xls_bytes: bytes, sheet_name: str):
     """
-    Read A(date), B(stock/receipts), C(consumption). Aggregate duplicates by day,
-    then reindex to a full daily range (prevents duplicate-index reindex errors).
+    Read time-series sheet and return daily 'stock' (B-like) and 'cons' (C-like) series.
+    - Detect date/stock/cons columns by name or by numeric content.
+    - Aggregate duplicate dates.
+    - Reindex to full daily range.
     """
     df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet_name)
+
     cols = list(df.columns)
-    if len(cols) < 3:
-        raise ValueError(f"Feuille '{sheet_name}': colonnes insuffisantes (A,B,C).")
 
-    date_col, stock_col, cons_col = cols[0], cols[1], cols[2]
+    # --- detect date column by convertibility ---
+    dt_scores = {}
+    for c in cols:
+        try:
+            dt = pd.to_datetime(df[c], errors="coerce")
+            dt_scores[c] = dt.notna().mean()
+        except Exception:
+            dt_scores[c] = 0.0
+    date_col = max(dt_scores, key=dt_scores.get) if dt_scores else cols[0]
     dates = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
-    if dates.isna().all():
-        raise ValueError(f"Feuille '{sheet_name}': colonne A (dates) non valide.")
 
-    stock = pd.to_numeric(df[stock_col], errors="coerce").fillna(0.0).astype(float)
-    cons  = pd.to_numeric(df[cons_col],  errors="coerce").fillna(0.0).astype(float)
+    # --- candidate numeric columns (except date) ---
+    numeric_candidates = [c for c in cols if c != date_col]
+    parsed = {c: _parse_num_locale(df[c]) for c in numeric_candidates}
+    totals = {c: float(parsed[c].abs().sum()) for c in numeric_candidates}
+
+    def _score_name(c: str) -> int:
+        lc = str(c).lower()
+        if any(k in lc for k in ["cons", "qté", "qte", "quant", "demand"]): return 2  # consumption
+        if any(k in lc for k in ["stock", "receipt", "récept", "recept", "on_hand"]): return 1  # stock/receipts
+        return 0
+
+    ranked = sorted(numeric_candidates, key=lambda c: (_score_name(c), totals[c]), reverse=True)
+
+    cons_col = None
+    for c in ranked:
+        if _score_name(c) == 2:
+            cons_col = c; break
+    if cons_col is None and ranked:
+        cons_col = ranked[0]
+
+    stock_col = None
+    for c in ranked:
+        if c != cons_col and _score_name(c) == 1:
+            stock_col = c; break
+    if stock_col is None:
+        for c in ranked:
+            if c != cons_col:
+                stock_col = c; break
+
+    if dates.isna().all():
+        raise ValueError(f"Feuille '{sheet_name}': aucune date exploitable.")
+    if cons_col is None or stock_col is None:
+        fallback = [c for c in cols[:3] if c != date_col]
+        if len(fallback) >= 2:
+            stock_col, cons_col = fallback[0], fallback[1]
+        else:
+            raise ValueError(f"Feuille '{sheet_name}': colonnes stock/cons introuvables.")
+
+    stock = parsed.get(stock_col, _parse_num_locale(df[stock_col]))
+    cons  = parsed.get(cons_col,  _parse_num_locale(df[cons_col]))
 
     g = (
         pd.DataFrame({"date": dates, "b": stock, "c": cons})
@@ -361,10 +423,8 @@ def _fc_daily_B_and_C(xls_bytes: bytes, sheet_name: str):
         raise ValueError(f"Feuille '{sheet_name}': aucune ligne exploitable après agrégation.")
 
     full_idx = pd.date_range(g.index.min(), g.index.max(), freq="D")
-    stock_daily = g["b"].reindex(full_idx, fill_value=0.0)
-    cons_daily  = g["c"].reindex(full_idx, fill_value=0.0)
-    stock_daily.index.name = "date"
-    cons_daily.index.name  = "date"
+    stock_daily = g["b"].reindex(full_idx, fill_value=0.0); stock_daily.index.name = "date"
+    cons_daily  = g["c"].reindex(full_idx, fill_value=0.0); cons_daily.index.name  = "date"
     return stock_daily, cons_daily
 
 def _fc_interval_sum_next_days(daily: pd.Series, start_idx: int, interval: int) -> float:
@@ -508,7 +568,7 @@ def _fc_rolling_with_rops_single_run(
                 "stock_on_hand_running": float(stock_running_cum),
                 "can_cover_interval": bool(can_cover),
                 "order_qty_policy": float(order_qty_policy),
-                "order_policy": order_policy,  # will be replaced in display table
+                "order_policy": order_policy,  # replaced at display by 'order'
                 "forecast_per_period": f,
                 "forecast_for_interval": float(forecast_for_interval),
                 "forecast_error": float(real_demand - forecast_for_interval),
@@ -592,7 +652,6 @@ def _fc_grid_search_and_final_for_method(
     df_best = pd.DataFrame(best_rows_per_code)
     return df_all, df_best
 
-# ----- Pick best params; display table with 'order' column -----
 def _fc_pick_params(row: pd.Series, metric: str):
     if metric == "best_ME":
         return row["best_ME_alpha"], row["best_ME_window"], int(row["best_ME_interval"])
@@ -616,14 +675,12 @@ def _fc_final_run_for_best(
     )
 
 def _display_table_with_order(df_run: pd.DataFrame):
-    """Create display table: replace 'order_policy' with 'order' (qty)."""
     if df_run.empty:
         return pd.DataFrame()
     tbl = df_run.copy()
     tbl["order"] = tbl["order_qty_policy"].round(2)
     if "order_policy" in tbl.columns:
         tbl = tbl.drop(columns=["order_policy"])
-    # Select/arrange columns for readability
     cols = [
         "method","date","code","interval",
         "real_demand","stock_on_hand_interval","stock_on_hand_running","can_cover_interval",
@@ -636,13 +693,7 @@ def _display_table_with_order(df_run: pd.DataFrame):
     cols = [c for c in cols if c in tbl.columns]
     return tbl[cols]
 
-# ----- Service level trade-off (points for same product & params; SL varies) -----
 def summarize_hold_vs_rupture(df_run: pd.DataFrame):
-    """
-    Holding = sum(max(ROP - demand, 0))
-    Rupture = sum(max(demand - ROP, 0))
-    Also return share_covered = mean(ROP >= demand)
-    """
     if df_run.empty:
         return 0.0, 0.0, 0.0
     diff = (df_run["reorder_point_usine"] - df_run["real_demand"]).astype(float)
@@ -652,17 +703,12 @@ def summarize_hold_vs_rupture(df_run: pd.DataFrame):
     return float(holding), float(rupture), float(share)
 
 def make_service_level_tradeoff_plot(points_df: pd.DataFrame, title: str):
-    """
-    points_df: columns = service_level, holding, rupture
-    x = holding, y = rupture
-    """
     if points_df.empty:
         return None
     xs = points_df["holding"].values
     ys = points_df["rupture"].values
     order = np.argsort(xs)
     xs, ys = xs[order], ys[order]
-    # simple smoothing over the few points
     smooth = pd.Series(ys).rolling(window=min(5, max(3, len(ys))), center=True, min_periods=1).mean().values
 
     fig, ax = plt.subplots(figsize=(8, 4.8))
@@ -926,17 +972,18 @@ else:
                                     nb_sim=int(nb_sim), rng_seed=int(rng_seed),
                                 )
                                 tbl = _display_table_with_order(df_final_table)
-                                if tbl.empty:
-                                    st.info("Pas assez de points pour ce produit.")
-                                else:
-                                    st.dataframe(tbl, use_container_width=True)
-                                    st.download_button(
-                                        "Télécharger la table (CSV)",
-                                        data=tbl.to_csv(index=False).encode("utf-8"),
-                                        file_name=f"details_{m}_{code_for_table}.csv", mime="text/csv"
-                                    )
+                                if tbl.empty or (tbl[["real_demand","stock_on_hand_interval","forecast_for_interval"]].sum().sum() == 0):
+                                    st.warning("Données nulles dans la fenêtre d’évaluation pour ce produit. "
+                                               "Vérifiez la colonne C (consommation) et le format des nombres, "
+                                               "ou réduisez le window ratio.")
+                                st.dataframe(tbl, use_container_width=True)
+                                st.download_button(
+                                    "Télécharger la table (CSV)",
+                                    data=tbl.to_csv(index=False).encode("utf-8"),
+                                    file_name=f"details_{m}_{code_for_table}.csv", mime="text/csv"
+                                )
 
-                            # ---- Service-level tradeoff plot: points for same product, SL varies ----
+                            # ---- Service-level tradeoff plot: same product/params; SL varies ----
                             st.markdown("### Courbe service level — points (x=holding, y=rupture)")
                             if not _SCIPY_OK:
                                 st.info("Impossible sans SciPy (ROP non calculé).")
