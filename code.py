@@ -2,35 +2,19 @@
 import io
 import re
 from pathlib import Path
-from typing import Tuple, List, Dict
+from typing import Tuple, List
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# ====== NEW (forecasting dep) ======
+# ====== Optional dependency for ROP simulation ======
 try:
     from scipy.stats import nbinom
     _SCIPY_OK = True
 except Exception:
     _SCIPY_OK = False
-
-# -------------------- Chemins logos --------------------
-APP_DIR = Path(__file__).parent
-ASSETS = APP_DIR / "assets"
-ASSETS.mkdir(exist_ok=True)
-
-DELICE_LOGO_PATH = ASSETS / "5751b545-5000-44a9-aa6c-5f2c02b75db1.png"      # gauche
-POLYTECH_LOGO_PATH = ASSETS / "90dbbfef-3449-4cf4-82b1-e5246a1d65d9.png"    # droite
-
-# Fallback si placés à la racine
-if not DELICE_LOGO_PATH.exists():
-    alt = APP_DIR / DELICE_LOGO_PATH.name
-    if alt.exists(): DELICE_LOGO_PATH = alt
-if not POLYTECH_LOGO_PATH.exists():
-    alt = APP_DIR / POLYTECH_LOGO_PATH.name
-    if alt.exists(): POLYTECH_LOGO_PATH = alt
 
 # --------------------- Seuils Syntetos & Boylan ---------------------
 ADI_CUTOFF = 1.32
@@ -46,9 +30,9 @@ st.markdown(
       /* Masquer l’en-tête Streamlit */
       header[data-testid="stHeader"] { display: none; }
 
-      /* Laisser de la place sous la barre fixe (2 rangées) */
-      .block-container { padding-top: 180px; }
-      @media (max-width: 880px) { .block-container { padding-top: 210px; } }
+      /* Laisser de la place sous la barre fixe (1 rangée) */
+      .block-container { padding-top: 120px; }
+      @media (max-width: 880px) { .block-container { padding-top: 140px; } }
 
       /* Barre fixe */
       .fixed-header {
@@ -65,14 +49,6 @@ st.markdown(
       }
 
       :root { --ctrl-h: 46px; }
-
-      /* Rangée logos: extrémités */
-      .logos-row {
-        display: flex; align-items: center; justify-content: space-between;
-        min-height: var(--ctrl-h);
-      }
-      .logos-row img { max-height: 48px; height: 48px; width: auto; }
-      .logo-miss { color:#c81d25; font-weight:600; }
 
       /* Rangée contrôles: *collée à droite* */
       .controls-holder { position: relative; height: var(--ctrl-h); }
@@ -351,30 +327,45 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
     return result_df, info_msgs, warn_msgs
 
 # ======================== FORECASTING (integrated) =========================
-# ---- Helpers to parse workbook ----
 def _fc_list_time_serie_codes(xls: pd.ExcelFile) -> List[str]:
+    """
+    Retourne des 'codes' déduits des noms de feuilles de type time series.
+    Tolère accents, underscores, hyphens, espaces, et le préfixe 'TS'.
+    """
     codes = []
-    patt = re.compile(r"time\s*ser(i|ie)s?\s*(.*)", re.IGNORECASE)
     for s in xls.sheet_names:
-        m = patt.search(s)
-        if m:
-            tail = s[m.end():].strip()
-            if tail:
-                codes.append(tail)
+        sn = _norm(s).replace("-", " ").replace("_", " ")
+        if re.match(r"^(time\s*s[eé]r(?:i|ie|ies)?|timeserie|time\s*series|ts)\b", sn, flags=re.IGNORECASE):
+            m_code = re.search(r"[A-Za-z]{2}\d{3,6}\b", s)
+            if m_code:
+                codes.append(m_code.group(0))
+            else:
+                tail_tokens = re.split(r"[:\s]+", s.strip())
+                if tail_tokens:
+                    codes.append(tail_tokens[-1])
     return sorted(set(codes))
 
 def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
-    target = f"time serie {code}"
-    if target in xls.sheet_names:
-        return target
-    patt = re.compile(r"time\s*ser(i|ie)s?\s*", re.IGNORECASE)
-    cand = [s for s in xls.sheet_names if patt.search(s) and code.lower() in s.lower()]
-    if cand:
-        return sorted(cand, key=len, reverse=True)[0]
+    """
+    Résout une feuille à partir d'un code produit OU d'un nom de feuille exact (sélection manuelle).
+    """
+    if code in xls.sheet_names:
+        return code
+
+    lc = code.lower().strip()
+    patterns = [
+        rf"^\s*time\s*s[eé]r(?:i|ie|ies)?[\s:_-]*{re.escape(lc)}\s*$",
+        rf"^\s*timeserie[\s:_-]*{re.escape(lc)}\s*$",
+        rf"^\s*time\s*series[\s:_-]*{re.escape(lc)}\s*$",
+        rf"^\s*ts[\s:_-]*{re.escape(lc)}\s*$",
+        rf".*\b{re.escape(lc)}\b.*",
+    ]
     for s in xls.sheet_names:
-        if s.strip().lower() == code.lower():
+        sn = s.lower().strip()
+        if any(re.match(p, sn) for p in patterns):
             return s
-    raise ValueError(f"Onglet pour '{code}' introuvable (attendu: 'time serie {code}').")
+
+    raise ValueError(f"Onglet pour '{code}' introuvable.")
 
 def _fc_daily_B_and_C(xls_bytes: bytes, sheet_name: str):
     df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet_name)
@@ -404,7 +395,6 @@ def _fc_interval_sum_next_days(daily: pd.Series, start_idx: int, interval: int) 
     e = s + int(max(0, interval))
     return float(pd.Series(daily).iloc[s:e].sum())
 
-# ---- Forecast cores ----
 def _fc_croston_or_sba_forecast(x, alpha: float, variant: str = "sba"):
     x = pd.Series(x).fillna(0.0).astype(float).values
     x = np.where(x < 0, 0.0, x)
@@ -513,7 +503,6 @@ def _fc_rolling_with_rops_single_run(
 
             forecast_for_interval = f * interval
 
-            # --- ROPs (Negative Binomial simulation if SciPy present; else set NaN & warn) ---
             if _SCIPY_OK:
                 X_Lt = lead_time * f
                 sigma_Lt = sigma_period * np.sqrt(max(lead_time, 1e-9))
@@ -622,7 +611,6 @@ def _fc_grid_search_and_final_for_method(
 
         df_metrics = pd.DataFrame(metrics_rows)
 
-        # Best indices (safe against NaN)
         best_ME_idx = (df_metrics["absME"]).idxmin() if df_metrics["absME"].notna().any() else None
         best_MSE_idx = (df_metrics["MSE"]).idxmin()   if df_metrics["MSE"].notna().any()  else None
         best_RMSE_idx = (df_metrics["RMSE"]).idxmin() if df_metrics["RMSE"].notna().any() else None
@@ -654,8 +642,6 @@ def _fc_grid_search_and_final_for_method(
 
     df_all = pd.DataFrame(all_results)
     df_best = pd.DataFrame(best_rows_per_code)
-
-    # Optional: final recalc tables can be added if you need the per-date rows displayed here.
     return df_all, df_best
 
 # ============================== Interface ==============================
@@ -666,20 +652,7 @@ nonce = st.session_state["uploader_nonce"]
 # ---------- BARRE FIXE ----------
 st.markdown('<div class="fixed-header"><div class="fixed-inner">', unsafe_allow_html=True)
 
-# Rangée 1 : logos aux coins
-st.markdown('<div class="logos-row">', unsafe_allow_html=True)
-if DELICE_LOGO_PATH.exists():
-    st.image(str(DELICE_LOGO_PATH))
-else:
-    st.caption('<span class="logo-miss">Logo Délice manquant</span>', unsafe_allow_html=True)
-# espace automatique via justify-content: space-between (le suivant ira à droite)
-if POLYTECH_LOGO_PATH.exists():
-    st.image(str(POLYTECH_LOGO_PATH))
-else:
-    st.caption('<span class="logo-miss">Logo PI manquant</span>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
-
-# Rangée 2 : contrôles collés à droite
+# Rangée : contrôles collés à droite
 st.markdown('<div class="controls-holder"><div class="controls-right">', unsafe_allow_html=True)
 
 st.markdown('<div class="control">', unsafe_allow_html=True)
@@ -710,6 +683,7 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown('</div></div>', unsafe_allow_html=True)  # fin controls + holder
 st.markdown('</div></div>', unsafe_allow_html=True)  # fin header
+
 # ----------------------------- FIN BARRE FIXE -----------------------------
 
 st.title("Classification minimale — taille/fréquence → CV² & p → méthode")
@@ -819,13 +793,13 @@ if uploaded is not None and sheet_name is not None:
 else:
     st.info("Téléversez d’abord le classeur de classification. (Vous pouvez aussi téléverser un classeur d’optimisation séparé.)")
 
-# ====================== NEW SECTION: Prévisions & ROP ======================
+# ====================== SECTION: Prévisions & ROP ======================
 st.markdown("---")
 st.header("📈 Prévisions & ROP — SBA / SES / Croston")
 
 _fc_src = uploaded_opt or uploaded
 if _fc_src is None:
-    st.info("Téléversez un classeur contenant des feuilles **time serie <CODE>** (via 'optimisation' de préférence).")
+    st.info("Téléversez un classeur contenant des feuilles **time serie <CODE>** (idéalement via ‘optimisation’).")
 else:
     xls_bytes = _get_excel_bytes(_fc_src)
     try:
@@ -836,12 +810,24 @@ else:
 
     if xls is not None:
         codes = _fc_list_time_serie_codes(xls)
+
         if not codes:
             st.warning("Aucune feuille 'time serie *' détectée.")
-        else:
+            with st.expander("🔎 Diagnostic"):
+                st.write("Feuilles disponibles :", xls.sheet_names)
+                st.caption("Noms acceptés (insensibles à la casse/accents/espaces) : "
+                           "`time serie*`, `time séries*`, `timeserie*`, `time series*`, `ts*`.")
+            manual_sheets = st.multiselect(
+                "Sélection manuelle des feuilles à traiter (si les noms ne suivent pas le format standard) :",
+                options=xls.sheet_names,
+            )
+            if manual_sheets:
+                codes = manual_sheets
+
+        if codes:
             c_left, c_right = st.columns([2,1])
             with c_left:
-                selected_codes = st.multiselect("Codes produit", options=codes, default=codes)
+                selected_codes = st.multiselect("Codes produit / Feuilles", options=codes, default=codes)
                 methods = st.multiselect("Méthodes", options=["sba", "ses", "croston"], default=["sba", "ses", "croston"])
                 pick_metric = st.selectbox("Critère de sélection", ["best_RMSE", "best_MSE", "best_ME"], index=0)
                 alphas = st.multiselect("Alphas", [0.1, 0.2, 0.3, 0.4], default=[0.1, 0.2, 0.3, 0.4])
@@ -861,7 +847,7 @@ else:
             run = st.button("▶️ Lancer les prévisions (grid search + résumé)")
             if run:
                 if not selected_codes:
-                    st.warning("Sélectionnez au moins un code produit.")
+                    st.warning("Sélectionnez au moins un code/feuille.")
                 elif not methods:
                     st.warning("Sélectionnez au moins une méthode.")
                 else:
@@ -905,3 +891,5 @@ else:
                                 file_name=f"grid_search_{m}.csv",
                                 mime="text/csv",
                             )
+        else:
+            st.info("Ajoutez un classeur avec des feuilles de type **time serie <CODE>** ou utilisez la sélection manuelle.")
