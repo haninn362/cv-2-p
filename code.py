@@ -1,4 +1,4 @@
-# app.pyv
+# app.py
 import io
 import re
 from typing import Tuple, List
@@ -26,14 +26,9 @@ st.set_page_config(page_title="Classification de la demande — p & CV²", layou
 st.markdown(
     """
     <style>
-      /* Masquer l’en-tête Streamlit */
       header[data-testid="stHeader"] { display: none; }
-
-      /* Laisser de la place sous la barre fixe */
       .block-container { padding-top: 120px; }
       @media (max-width: 880px) { .block-container { padding-top: 140px; } }
-
-      /* Barre fixe */
       .fixed-header {
         position: fixed; top: 0; left: 0; right: 0;
         z-index: 10000;
@@ -41,42 +36,22 @@ st.markdown(
         border-bottom: 1px solid rgba(49,51,63,.14);
         box-shadow: 0 2px 10px rgba(0,0,0,.05);
       }
-      .fixed-inner {
-        padding: .55rem .9rem .8rem;
-        max-width: 1200px;
-        margin: 0 auto;
-      }
-
+      .fixed-inner { padding: .55rem .9rem .8rem; max-width: 1200px; margin: 0 auto; }
       :root { --ctrl-h: 46px; }
-
-      /* Rangée contrôles: *collée à droite* */
       .controls-holder { position: relative; height: var(--ctrl-h); }
       .controls-right {
-        position: absolute; right: 0; top: 0;
-        display: flex; gap: .75rem; align-items: center;
+        position: absolute; right: 0; top: 0; display: flex; gap: .75rem; align-items: center;
       }
       .controls-right .control { width: 280px; max-width: 320px; }
-
-      /* Uploaders compacts */
       .fixed-header .stFileUploader { width: 100%; }
       .fixed-header .stFileUploader > div > div {
-        height: var(--ctrl-h);
-        display:flex; align-items:center;
-        border-radius: 999px !important;
-        border: 1px solid rgba(49,51,63,.25) !important;
-        padding: .15rem .9rem !important;
-        background: rgba(0,0,0,0.02) !important;
+        height: var(--ctrl-h); display:flex; align-items:center;
+        border-radius: 999px !important; border: 1px solid rgba(49,51,63,.25) !important;
+        padding: .15rem .9rem !important; background: rgba(0,0,0,0.02) !important;
       }
-      .fixed-header .stFileUploader label,
-      .fixed-header .stFileUploader small { display:none; }
-
-      /* Bouton reset identique en hauteur */
+      .fixed-header .stFileUploader label, .fixed-header .stFileUploader small { display:none; }
       .fixed-header .stButton>button {
-        height: var(--ctrl-h);
-        width: 100%;
-        border-radius: 999px;
-        font-weight: 700;
-        padding: .45rem 1rem;
+        height: var(--ctrl-h); width: 100%; border-radius: 999px; font-weight: 700; padding: .45rem 1rem;
       }
     </style>
     """,
@@ -327,10 +302,6 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
 
 # ======================== FORECASTING (integrated) =========================
 def _fc_list_time_serie_codes(xls: pd.ExcelFile) -> List[str]:
-    """
-    Retourne des 'codes' déduits des noms de feuilles de type time series.
-    Tolère accents, underscores, hyphens, espaces, et le préfixe 'TS'.
-    """
     codes = []
     for s in xls.sheet_names:
         sn = _norm(s).replace("-", " ").replace("_", " ")
@@ -345,12 +316,8 @@ def _fc_list_time_serie_codes(xls: pd.ExcelFile) -> List[str]:
     return sorted(set(codes))
 
 def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
-    """
-    Résout une feuille à partir d'un code produit OU d'un nom de feuille exact (sélection manuelle).
-    """
-    if code in xls.sheet_names:
+    if code in xls.sheet_names:  # manual selection can pass a full sheet name
         return code
-
     lc = code.lower().strip()
     patterns = [
         rf"^\s*time\s*s[eé]r(?:i|ie|ies)?[\s:_-]*{re.escape(lc)}\s*$",
@@ -363,13 +330,12 @@ def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
         sn = s.lower().strip()
         if any(re.match(p, sn) for p in patterns):
             return s
-
     raise ValueError(f"Onglet pour '{code}' introuvable.")
 
 def _fc_daily_B_and_C(xls_bytes: bytes, sheet_name: str):
     """
-    Read A(date), B(stock/receipts), C(consumption). Aggregate duplicates by day
-    before reindexing to a full daily range to avoid duplicate-index errors.
+    Read A(date), B(stock/receipts), C(consumption). Aggregate duplicates by day,
+    then reindex to a full daily range (prevents duplicate-index reindex errors).
     """
     df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet_name)
     cols = list(df.columns)
@@ -377,7 +343,6 @@ def _fc_daily_B_and_C(xls_bytes: bytes, sheet_name: str):
         raise ValueError(f"Feuille '{sheet_name}': colonnes insuffisantes (A,B,C).")
 
     date_col, stock_col, cons_col = cols[0], cols[1], cols[2]
-
     dates = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
     if dates.isna().all():
         raise ValueError(f"Feuille '{sheet_name}': colonne A (dates) non valide.")
@@ -457,10 +422,7 @@ def _fc_compute_metrics(df_run: pd.DataFrame):
     if df_run.empty or "forecast_error" not in df_run:
         return np.nan, np.nan, np.nan, np.nan
     e = df_run["forecast_error"].astype(float)
-    ME = e.mean()
-    absME = e.abs().mean()
-    MSE = (e**2).mean()
-    RMSE = np.sqrt(MSE)
+    ME = e.mean(); absME = e.abs().mean(); MSE = (e**2).mean(); RMSE = np.sqrt(MSE)
     return ME, absME, MSE, RMSE
 
 def _fc_rolling_with_rops_single_run(
@@ -506,12 +468,10 @@ def _fc_rolling_with_rops_single_run(
             can_cover = bool(stock_running_cum >= real_demand)
             if can_cover:
                 order_qty_policy = 0.5 * real_demand
-                stock_status = "holding"
-                order_policy = "half_of_interval_demand"
+                stock_status = "holding"; order_policy = "half_of_interval_demand"
             else:
                 order_qty_policy = max(real_demand - stock_running_cum, 0.0)
-                stock_status = "rupture"
-                order_policy = "shortfall_to_cover"
+                stock_status = "rupture"; order_policy = "shortfall_to_cover"
 
             forecast_for_interval = f * interval
 
@@ -537,40 +497,30 @@ def _fc_rolling_with_rops_single_run(
             else:
                 X_Lt = lead_time * f
                 X_Lt_Lw = (lead_time + lead_time_supplier) * f
-                ROP_u = np.nan
-                ROP_f = np.nan
+                ROP_u = np.nan; ROP_f = np.nan
 
             rop_carry_running += float((ROP_u if _SCIPY_OK else 0.0) - real_demand)
 
             rows.append({
-                "method": method,
-                "date": test_date.date(),
-                "code": product_code,
-                "interval": int(interval),
-
+                "method": method, "date": test_date.date(), "code": product_code, "interval": int(interval),
                 "real_demand": float(real_demand),
                 "stock_on_hand_interval": float(stock_on_hand_interval),
                 "stock_on_hand_running": float(stock_running_cum),
                 "can_cover_interval": bool(can_cover),
                 "order_qty_policy": float(order_qty_policy),
                 "order_policy": order_policy,
-
                 "forecast_per_period": f,
                 "forecast_for_interval": float(forecast_for_interval),
                 "forecast_error": float(real_demand - forecast_for_interval),
-
                 "X_Lt": float(X_Lt),
                 "reorder_point_usine": float(ROP_u),
                 "lead_time_usine_days": int(lead_time),
                 "lead_time_supplier_days": int(lead_time_supplier),
                 "X_Lt_Lw": float(X_Lt_Lw),
                 "reorder_point_fournisseur": float(ROP_f),
-
                 "stock_status": stock_status,
                 "rop_usine_minus_real_running": float(rop_carry_running),
-
-                "z_t": float(fc.get("z_t", 0.0)),
-                "p_t": float(fc.get("p_t", 1.0)),
+                "z_t": float(fc.get("z_t", 0.0)), "p_t": float(fc.get("p_t", 1.0)),
             })
 
     return pd.DataFrame(rows)
@@ -599,30 +549,19 @@ def _fc_grid_search_and_final_for_method(
             for w in window_ratios:
                 for itv in intervals:
                     df_run = _fc_rolling_with_rops_single_run(
-                        xls_bytes=xls_bytes,
-                        xls=xls,
-                        product_code=code,
-                        method=method,
-                        alpha=a,
-                        window_ratio=w,
-                        interval=itv,
-                        lead_time=lead_time,
-                        lead_time_supplier=lead_time_supplier,
-                        service_level=service_level,
-                        nb_sim=nb_sim,
-                        rng_seed=rng_seed,
+                        xls_bytes=xls_bytes, xls=xls, product_code=code, method=method,
+                        alpha=a, window_ratio=w, interval=itv,
+                        lead_time=lead_time, lead_time_supplier=lead_time_supplier,
+                        service_level=service_level, nb_sim=nb_sim, rng_seed=rng_seed,
                     )
                     ME, absME, MSE, RMSE = _fc_compute_metrics(df_run)
                     row = {
                         "code": code, "method": method, "alpha": a, "window_ratio": w, "recalc_interval": itv,
-                        "ME": ME, "absME": absME, "MSE": MSE, "RMSE": RMSE,
-                        "n_points": len(df_run)
+                        "ME": ME, "absME": absME, "MSE": MSE, "RMSE": RMSE, "n_points": len(df_run)
                     }
-                    metrics_rows.append(row)
-                    all_results.append(row)
+                    metrics_rows.append(row); all_results.append(row)
 
         df_metrics = pd.DataFrame(metrics_rows)
-
         best_ME_idx = (df_metrics["absME"]).idxmin() if df_metrics["absME"].notna().any() else None
         best_MSE_idx = (df_metrics["MSE"]).idxmin()   if df_metrics["MSE"].notna().any()  else None
         best_RMSE_idx = (df_metrics["RMSE"]).idxmin() if df_metrics["RMSE"].notna().any() else None
@@ -638,23 +577,75 @@ def _fc_grid_search_and_final_for_method(
             "best_ME_interval": None if best_ME is None else best_ME["recalc_interval"],
             "best_ME": None if best_ME is None else best_ME["ME"],
             "best_absME": None if best_ME is None else best_ME["absME"],
-
             "best_MSE_alpha": None if best_MSE is None else best_MSE["alpha"],
             "best_MSE_window": None if best_MSE is None else best_MSE["window_ratio"],
             "best_MSE_interval": None if best_MSE is None else best_MSE["recalc_interval"],
             "best_MSE": None if best_MSE is None else best_MSE["MSE"],
-
             "best_RMSE_alpha": None if best_RMSE is None else best_RMSE["alpha"],
             "best_RMSE_window": None if best_RMSE is None else best_RMSE["window_ratio"],
             "best_RMSE_interval": None if best_RMSE is None else best_RMSE["recalc_interval"],
             "best_RMSE": None if best_RMSE is None else best_RMSE["RMSE"],
-
             "n_points_used": int(best_RMSE["n_points"]) if best_RMSE is not None else 0,
         })
 
     df_all = pd.DataFrame(all_results)
     df_best = pd.DataFrame(best_rows_per_code)
     return df_all, df_best
+
+# ----- Helpers to run final for best params and plot rupture vs holding -----
+def _fc_pick_params(row: pd.Series, metric: str):
+    if metric == "best_ME":
+        return row["best_ME_alpha"], row["best_ME_window"], int(row["best_ME_interval"])
+    if metric == "best_MSE":
+        return row["best_MSE_alpha"], row["best_MSE_window"], int(row["best_MSE_interval"])
+    return row["best_RMSE_alpha"], row["best_RMSE_window"], int(row["best_RMSE_interval"])
+
+def _fc_final_run_for_best(
+    xls_bytes: bytes, xls: pd.ExcelFile, method: str, df_best: pd.DataFrame, code: str,
+    pick_metric: str, lead_time: int, lead_time_supplier: int, service_level: float, nb_sim: int, rng_seed: int
+):
+    row = df_best[df_best["code"].astype(str) == str(code)]
+    if row.empty: return pd.DataFrame()
+    a, w, itv = _fc_pick_params(row.iloc[0], pick_metric)
+    if pd.isna(a) or pd.isna(w) or pd.isna(itv): return pd.DataFrame()
+    return _fc_rolling_with_rops_single_run(
+        xls_bytes=xls_bytes, xls=xls, product_code=code, method=method,
+        alpha=float(a), window_ratio=float(w), interval=int(itv),
+        lead_time=lead_time, lead_time_supplier=lead_time_supplier,
+        service_level=service_level, nb_sim=nb_sim, rng_seed=rng_seed,
+    )
+
+def make_rupture_holding_plot(df_run: pd.DataFrame, title: str):
+    """
+    x = stock sufficiency margin (stock_running - real_demand).
+    y = rupture deficit = max(real_demand - stock_running, 0).
+    """
+    if df_run.empty:
+        return None
+    suff = df_run["stock_on_hand_running"] - df_run["real_demand"]
+    deficit = (df_run["real_demand"] - df_run["stock_on_hand_running"]).clip(lower=0)
+    mask = suff.notna() & deficit.notna()
+    x = suff[mask].values
+    y = deficit[mask].values
+    if len(x) == 0:
+        return None
+
+    order = np.argsort(x)
+    xs = x[order]; ys = y[order]
+    # smooth via centered rolling mean on sorted points
+    k = max(3, len(xs)//8)
+    smooth = pd.Series(ys).rolling(window=k, center=True, min_periods=1).mean().values
+
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    ax.scatter(xs, ys, s=18, alpha=0.75)
+    ax.plot(xs, smooth, linewidth=3)
+    ax.axvline(0, linestyle="--", alpha=0.5)
+    ax.set_title(title)
+    ax.set_xlabel("holding  ⟶  (marge de stock = stock cumulé - demande intervalle)")
+    ax.set_ylabel("rupture  (déficit attendu sur l’intervalle)")
+    ax.grid(alpha=0.15)
+    fig.tight_layout()
+    return fig
 
 # ============================== Interface ==============================
 if "uploader_nonce" not in st.session_state:
@@ -664,7 +655,6 @@ nonce = st.session_state["uploader_nonce"]
 # ---------- BARRE FIXE ----------
 st.markdown('<div class="fixed-header"><div class="fixed-inner">', unsafe_allow_html=True)
 
-# Rangée : contrôles collés à droite
 st.markdown('<div class="controls-holder"><div class="controls-right">', unsafe_allow_html=True)
 
 st.markdown('<div class="control">', unsafe_allow_html=True)
@@ -716,7 +706,6 @@ def compute_and_show(uploaded, sheet_name, uploaded_opt):
     if uploaded is None or sheet_name is None: return
     df_raw = pd.read_excel(uploaded, sheet_name=sheet_name)
 
-    # Sélecteur de produit
     col_produit = df_raw.columns[0]
     produits = sorted(df_raw[col_produit].astype(str).dropna().unique().tolist())
     if not produits:
@@ -827,8 +816,7 @@ else:
             st.warning("Aucune feuille 'time serie *' détectée.")
             with st.expander("🔎 Diagnostic"):
                 st.write("Feuilles disponibles :", xls.sheet_names)
-                st.caption("Noms acceptés (insensibles à la casse/accents/espaces) : "
-                           "`time serie*`, `time séries*`, `timeserie*`, `time series*`, `ts*`.")
+                st.caption("Noms acceptés : `time serie*`, `time séries*`, `timeserie*`, `time series*`, `ts*`.")
             manual_sheets = st.multiselect(
                 "Sélection manuelle des feuilles à traiter (si les noms ne suivent pas le format standard) :",
                 options=xls.sheet_names,
@@ -868,19 +856,11 @@ else:
                         with tab:
                             with st.spinner(f"Exécution {m.upper()}…"):
                                 df_all, df_best = _fc_grid_search_and_final_for_method(
-                                    xls_bytes=xls_bytes,
-                                    xls=xls,
-                                    product_codes=selected_codes,
-                                    method=m,
-                                    pick_metric=pick_metric,
-                                    alphas=alphas,
-                                    window_ratios=window_ratios,
-                                    intervals=recalc_intervals,
-                                    lead_time=int(lead_time),
-                                    lead_time_supplier=int(lead_time_supplier),
-                                    service_level=float(service_level),
-                                    nb_sim=int(nb_sim),
-                                    rng_seed=int(rng_seed),
+                                    xls_bytes=xls_bytes, xls=xls, product_codes=selected_codes,
+                                    method=m, pick_metric=pick_metric, alphas=alphas,
+                                    window_ratios=window_ratios, intervals=recalc_intervals,
+                                    lead_time=int(lead_time), lead_time_supplier=int(lead_time_supplier),
+                                    service_level=float(service_level), nb_sim=int(nb_sim), rng_seed=int(rng_seed),
                                 )
 
                             c1, c2 = st.columns([2,1], vertical_alignment="top")
@@ -891,8 +871,7 @@ else:
                                 st.download_button(
                                     "Télécharger (best) CSV",
                                     data=df_best.to_csv(index=False).encode("utf-8"),
-                                    file_name=f"best_combos_{m}.csv",
-                                    mime="text/csv",
+                                    file_name=f"best_combos_{m}.csv", mime="text/csv",
                                 )
 
                             st.subheader("Toutes les combinaisons testées")
@@ -900,8 +879,39 @@ else:
                             st.download_button(
                                 "Télécharger (grid) CSV",
                                 data=df_all.to_csv(index=False).encode("utf-8"),
-                                file_name=f"grid_search_{m}.csv",
-                                mime="text/csv",
+                                file_name=f"grid_search_{m}.csv", mime="text/csv",
                             )
+
+                            # ---- New plot: rupture vs holding (best params) ----
+                            st.markdown("### Courbe « rupture » vs « holding » (meilleurs paramètres)")
+                            code_for_plot = st.selectbox(
+                                "Produit pour le graphe", options=sorted(df_best["code"].astype(str).unique()),
+                                key=f"{m}_plot_code"
+                            )
+                            if code_for_plot:
+                                df_final = _fc_final_run_for_best(
+                                    xls_bytes=xls_bytes, xls=xls, method=m, df_best=df_best, code=code_for_plot,
+                                    pick_metric=pick_metric, lead_time=int(lead_time),
+                                    lead_time_supplier=int(lead_time_supplier), service_level=float(service_level),
+                                    nb_sim=int(nb_sim), rng_seed=int(rng_seed),
+                                )
+                                if df_final.empty:
+                                    st.info("Pas assez de points pour tracer ce produit avec les meilleurs paramètres.")
+                                else:
+                                    fig2 = make_rupture_holding_plot(
+                                        df_final, title=f"{m.upper()} — {code_for_plot} ({pick_metric})"
+                                    )
+                                    if fig2 is not None:
+                                        st.pyplot(fig2, use_container_width=True)
+                                        # download
+                                        pbuf2 = io.BytesIO()
+                                        fig2.savefig(pbuf2, format="png", bbox_inches="tight")
+                                        pbuf2.seek(0)
+                                        st.download_button(
+                                            "Télécharger le graphe (PNG)", data=pbuf2,
+                                            file_name=f"rupture_vs_holding_{m}_{code_for_plot}.png", mime="image/png"
+                                        )
+                                    else:
+                                        st.info("Impossible de générer le graphe (données insuffisantes).")
         else:
             st.info("Ajoutez un classeur avec des feuilles de type **time serie <CODE>** ou utilisez la sélection manuelle.")
