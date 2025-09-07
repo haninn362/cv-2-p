@@ -8,21 +8,21 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# ====== Optional dependency for ROP simulation (we'll wrap it safely) ======
+# ===== Optional SciPy for NB; we fall back to NumPy if missing
 try:
     from scipy.stats import nbinom
     _SCIPY_OK = True
 except Exception:
     _SCIPY_OK = False
 
-# --------------------- Seuils Syntetos & Boylan ---------------------
+# --------------------- Syntetos & Boylan thresholds ---------------------
 ADI_CUTOFF = 1.32
 P_CUTOFF = 1.0 / ADI_CUTOFF       # ≈ 0.757576
 CV2_CUTOFF = 0.49
 
 st.set_page_config(page_title="Classification de la demande — p & CV²", layout="wide")
 
-# ======================== Styles (barre FIXE) ========================
+# ======================== Styles (fixed bar) ========================
 st.markdown(
     """
     <style>
@@ -58,7 +58,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ============================ Logique principale ============================
+# ============================ Classification logic ============================
 def choose_method(p: float, cv2: float) -> Tuple[str, str]:
     if pd.isna(p) or pd.isna(cv2): return "Données insuffisantes", ""
     if p <= 0: return "Aucune demande", ""
@@ -170,15 +170,8 @@ def excel_bytes(combined_df, stats_df, counts_df, methods_df) -> io.BytesIO:
     buf.seek(0)
     return buf
 
-# ======================== Optimisation (n*, Qr*, Qw*) =======================
+# ======================== Helpers / Excel I/O =======================
 def _norm(s: str) -> str: return re.sub(r"\s+", " ", str(s).strip().lower())
-
-def _find_first_col(df: pd.DataFrame, starts_with: str = None, contains: str = None):
-    for c in df.columns:
-        cn = _norm(c)
-        if starts_with and cn.startswith(starts_with): return c
-        if contains and contains in cn: return c
-    return None
 
 def _get_excel_bytes(file_like) -> bytes:
     if file_like is None: return b""
@@ -191,6 +184,14 @@ def _get_excel_bytes(file_like) -> bytes:
     finally:
         try: file_like.seek(0)
         except Exception: pass
+
+# ======================== Optimisation (n*, Qr*, Qw*) =======================
+def _find_first_col(df: pd.DataFrame, starts_with: str = None, contains: str = None):
+    for c in df.columns:
+        cn = _norm(c)
+        if starts_with and cn.startswith(starts_with): return c
+        if contains and contains in cn: return c
+    return None
 
 def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation depots externe",
                                 time_series_prefix: str = "time seri"):
@@ -300,9 +301,10 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
     )
     return result_df, info_msgs, warn_msgs
 
-# ======================== FORECASTING (integrated) =========================
+# ======================== Forecasting / ROP =========================
+
 def _parse_num_locale(series) -> pd.Series:
-    """Robust numeric parser for '1 234,56' / '1,234.56' / '1234' / etc."""
+    """Parse numbers robustly: '1 234,56', '1,234.56', '1234' → float"""
     s = pd.Series(series)
     v1 = pd.to_numeric(s, errors="coerce")
     if v1.notna().mean() >= 0.60:
@@ -321,12 +323,10 @@ def _fc_list_time_serie_codes(xls: pd.ExcelFile) -> List[str]:
         sn = _norm(s).replace("-", " ").replace("_", " ")
         if re.match(r"^(time\s*s[eé]r(?:i|ie|ies)?|timeserie|time\s*series|ts)\b", sn, flags=re.IGNORECASE):
             m_code = re.search(r"[A-Za-z]{2}\d{3,6}\b", s)
-            if m_code:
-                codes.append(m_code.group(0))
+            if m_code: codes.append(m_code.group(0))
             else:
                 tail_tokens = re.split(r"[:\s]+", s.strip())
-                if tail_tokens:
-                    codes.append(tail_tokens[-1])
+                if tail_tokens: codes.append(tail_tokens[-1])
     return sorted(set(codes))
 
 def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
@@ -346,54 +346,30 @@ def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
             return s
     raise ValueError(f"Onglet pour '{code}' introuvable.")
 
-def _fc_daily_B_and_C(xls_bytes: bytes, sheet_name: str):
-    """Smart detection of date/stock/cons columns; aggregates duplicates; daily reindex."""
+def _fc_daily_B_and_C_simple(xls_bytes: bytes, sheet_name: str):
+    """
+    Strict reader like your original:
+      A: date, B: stock_on_hand / receipts, C: qté consommée
+    """
     df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet_name)
-    cols = list(df.columns)
+    if df.shape[1] < 3:
+        raise ValueError(f"Feuille '{sheet_name}' doit avoir au moins 3 colonnes (A,B,C).")
+    date_col  = df.columns[0]
+    stock_col = df.columns[1]
+    cons_col  = df.columns[2]
 
-    # detect date column
-    dt_scores = {}
-    for c in cols:
-        try:
-            dt = pd.to_datetime(df[c], errors="coerce")
-            dt_scores[c] = dt.notna().mean()
-        except Exception:
-            dt_scores[c] = 0.0
-    date_col = max(dt_scores, key=dt_scores.get) if dt_scores else cols[0]
     dates = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
-    if dates.isna().all():
-        raise ValueError(f"Feuille '{sheet_name}': aucune date exploitable.")
+    stock = _parse_num_locale(df[stock_col])
+    cons  = _parse_num_locale(df[cons_col])
 
-    numeric_candidates = [c for c in cols if c != date_col]
-    parsed = {c: _parse_num_locale(df[c]) for c in numeric_candidates}
-    totals = {c: float(parsed[c].abs().sum()) for c in numeric_candidates}
-
-    def _score_name(c: str) -> int:
-        lc = str(c).lower()
-        if any(k in lc for k in ["cons", "qté", "qte", "quant", "demand"]): return 2
-        if any(k in lc for k in ["stock", "receipt", "récept", "recept", "on_hand"]): return 1
-        return 0
-
-    ranked = sorted(numeric_candidates, key=lambda c: (_score_name(c), totals[c]), reverse=True)
-
-    cons_col = next((c for c in ranked if _score_name(c) == 2), ranked[0] if ranked else None)
-    stock_col = next((c for c in ranked if c != cons_col and _score_name(c) == 1),
-                     next((c for c in ranked if c != cons_col), None))
-
-    if cons_col is None or stock_col is None:
-        fb = [c for c in cols[:3] if c != date_col]
-        if len(fb) >= 2: stock_col, cons_col = fb[0], fb[1]
-        else: raise ValueError(f"Feuille '{sheet_name}': colonnes stock/cons introuvables.")
-
-    stock = parsed.get(stock_col, _parse_num_locale(df[stock_col]))
-    cons  = parsed.get(cons_col,  _parse_num_locale(df[cons_col]))
-
-    g = (pd.DataFrame({"date": dates, "b": stock, "c": cons})
-         .dropna(subset=["date"]).groupby("date", as_index=True)[["b", "c"]].sum().sort_index())
-
+    g = (
+        pd.DataFrame({"date": dates, "b": stock, "c": cons})
+        .dropna(subset=["date"])
+        .groupby("date", as_index=True)[["b", "c"]].sum()
+        .sort_index()
+    )
     if g.empty:
-        raise ValueError(f"Feuille '{sheet_name}': aucune ligne exploitable après agrégation.")
-
+        raise ValueError(f"Feuille '{sheet_name}': aucune donnée exploitable.")
     full_idx = pd.date_range(g.index.min(), g.index.max(), freq="D")
     stock_daily = g["b"].reindex(full_idx, fill_value=0.0); stock_daily.index.name = "date"
     cons_daily  = g["c"].reindex(full_idx, fill_value=0.0); cons_daily.index.name  = "date"
@@ -457,13 +433,8 @@ def _fc_compute_metrics(df_run: pd.DataFrame):
     ME = e.mean(); absME = e.abs().mean(); MSE = (e**2).mean(); RMSE = np.sqrt(MSE)
     return ME, absME, MSE, RMSE
 
-# ---- NB quantile via safe wrapper (SciPy if ok, else NumPy Gamma–Poisson) ----
+# ---- NB quantile: safe wrapper (SciPy if ok, else NumPy Gamma–Poisson) ----
 def _nb_quantile_safe(mean_, var_, service_level, nb_sim, rng):
-    """
-    Returns the service-level quantile of a Negative Binomial with
-    given mean and variance. Robust to edge cases; falls back to
-    Gamma–Poisson simulation if SciPy errors.
-    """
     mean_ = float(max(mean_, 0.0))
     var_  = float(max(var_, mean_ + 1e-9))            # enforce overdispersion
     sl    = float(np.clip(service_level, 1e-6, 1-1e-6))
@@ -472,7 +443,6 @@ def _nb_quantile_safe(mean_, var_, service_level, nb_sim, rng):
     if mean_ == 0.0:
         return 0.0
 
-    # try SciPy first
     if _SCIPY_OK:
         try:
             p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
@@ -482,9 +452,8 @@ def _nb_quantile_safe(mean_, var_, service_level, nb_sim, rng):
             sample = nbinom.rvs(r, p, size=n_s, random_state=rng)
             return float(np.percentile(sample, 100.0 * sl))
         except Exception:
-            pass  # fall through to NumPy fallback
+            pass  # fallback
 
-    # NumPy Gamma–Poisson mixture
     p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
     r = float(mean_**2 / (var_ - mean_)) if var_ > mean_ else 1e6
     if not np.isfinite(r) or r <= 0:
@@ -509,7 +478,8 @@ def _fc_rolling_with_rops_single_run(
     rng_seed: int,
 ):
     sheet = _fc_find_product_sheet(xls, product_code)
-    stock_daily, cons_daily = _fc_daily_B_and_C(xls_bytes, sheet)
+    # Use strict 3-column reader; if anything fails, fall back to smart parser (not shown here).
+    stock_daily, cons_daily = _fc_daily_B_and_C_simple(xls_bytes, sheet)
 
     vals = cons_daily.values
     split_index = int(len(vals) * window_ratio)
@@ -711,12 +681,12 @@ def make_service_level_tradeoff_plot(points_df: pd.DataFrame, title: str):
     fig.tight_layout()
     return fig
 
-# ============================== Interface ==============================
+# ============================== UI ==============================
 if "uploader_nonce" not in st.session_state:
     st.session_state["uploader_nonce"] = 0
 nonce = st.session_state["uploader_nonce"]
 
-# ---------- BARRE FIXE ----------
+# ---------- fixed bar ----------
 st.markdown('<div class="fixed-header"><div class="fixed-inner">', unsafe_allow_html=True)
 st.markdown('<div class="controls-holder"><div class="controls-right">', unsafe_allow_html=True)
 
@@ -746,12 +716,12 @@ if st.button("🔄 Réinitialiser", key=f"reset_{nonce}", help="Efface les fichi
     st.rerun()
 st.markdown('</div>', unsafe_allow_html=True)
 
-st.markdown('</div></div>', unsafe_allow_html=True)  # fin controls + holder
-st.markdown('</div></div>', unsafe_allow_html=True)  # fin header
+st.markdown('</div></div>', unsafe_allow_html=True)  # end controls + holder
+st.markdown('</div></div>', unsafe_allow_html=True)  # end header
 
 st.title("Classification minimale — taille/fréquence → CV² & p → méthode")
 
-# ===== Sélection de la feuille (classeur classification) =====
+# ===== classification sheet selector =====
 sheet_name = None
 if uploaded is not None:
     try:
@@ -852,13 +822,13 @@ if uploaded is not None and sheet_name is not None:
 else:
     st.info("Téléversez d’abord le classeur de classification. (Vous pouvez aussi téléverser un classeur d’optimisation séparé.)")
 
-# ====================== SECTION: Prévisions & ROP ======================
+# ====================== Section: Prévisions & ROP ======================
 st.markdown("---")
 st.header("📈 Prévisions & ROP — SBA / SES / Croston")
 
 _fc_src = uploaded_opt or uploaded
 if _fc_src is None:
-    st.info("Téléversez un classeur contenant des feuilles **time serie <CODE>** (idéalement via ‘optimisation’).")
+    st.info("Téléversez un classeur contenant des feuilles **time serie <CODE>**.")
 else:
     xls_bytes = _get_excel_bytes(_fc_src)
     try:
@@ -869,18 +839,9 @@ else:
 
     if xls is not None:
         codes = _fc_list_time_serie_codes(xls)
-
         if not codes:
             st.warning("Aucune feuille 'time serie *' détectée.")
-            with st.expander("🔎 Diagnostic"):
-                st.write("Feuilles disponibles :", xls.sheet_names)
-                st.caption("Noms acceptés : `time serie*`, `time séries*`, `timeserie*`, `time series*`, `ts*`.")
-            manual_sheets = st.multiselect(
-                "Sélection manuelle des feuilles à traiter (si les noms ne suivent pas le format standard) :",
-                options=xls.sheet_names,
-            )
-            if manual_sheets:
-                codes = manual_sheets
+            codes = xls.sheet_names  # allow manual selection
 
         if codes:
             c_left, c_right = st.columns([2,1])
@@ -971,11 +932,15 @@ else:
                                 "Produit pour la courbe", options=sorted(df_best["code"].astype(str).unique()),
                                 key=f"{m}_plot_code"
                             )
-                            levels_default = [0.80, 0.85, 0.90, 0.95, 0.975, 0.99]
+                            # Build options and defaults so defaults are ALWAYS in options
+                            options_levels = [round(float(x), 3) for x in np.linspace(0.80, 0.995, 20)]
+                            default_idx = [0, 3, 6, 9, 12, 15]  # 6 values, spaced
+                            levels_default = [options_levels[i] for i in default_idx if i < len(options_levels)]
                             service_levels = st.multiselect(
                                 "Niveaux de service à comparer (min. 5)",
-                                options=[round(x, 3) for x in np.linspace(0.80, 0.995, 20)],
-                                default=levels_default, key=f"{m}_levels"
+                                options=options_levels,
+                                default=levels_default,
+                                key=f"{m}_levels"
                             )
                             if code_for_plot and len(service_levels) >= 5:
                                 pts = []
@@ -1012,4 +977,4 @@ else:
                             else:
                                 st.info("Choisissez au moins 5 niveaux de service.")
         else:
-            st.info("Ajoutez un classeur avec des feuilles de type **time serie <CODE>** ou utilisez la sélection manuelle.")
+            st.info("Ajoutez un classeur avec des feuilles de type **time serie <CODE>**.")
