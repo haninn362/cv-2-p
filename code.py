@@ -304,15 +304,12 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
 def _parse_num_locale(series) -> pd.Series:
     """Robust numeric parser for '1 234,56' / '1,234.56' / '1234' / etc."""
     s = pd.Series(series)
-    # Try direct numeric
     v1 = pd.to_numeric(s, errors="coerce")
     if v1.notna().mean() >= 0.60:
         return v1.fillna(0.0).astype(float)
-    # Remove NBSP + spaces
     s2 = (s.astype(str)
             .str.replace("\u00A0", "", regex=False)
             .str.replace(" ", "", regex=False))
-    # Convert European format 1.234,56 -> 1234.56
     s2b = (s2.str.replace(".", "", regex=False)
               .str.replace(",", ".", regex=False))
     v2 = pd.to_numeric(s2b, errors="coerce")
@@ -333,7 +330,7 @@ def _fc_list_time_serie_codes(xls: pd.ExcelFile) -> List[str]:
     return sorted(set(codes))
 
 def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
-    if code in xls.sheet_names:  # manual selection can pass a full sheet name
+    if code in xls.sheet_names:
         return code
     lc = code.lower().strip()
     patterns = [
@@ -350,17 +347,11 @@ def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
     raise ValueError(f"Onglet pour '{code}' introuvable.")
 
 def _fc_daily_B_and_C(xls_bytes: bytes, sheet_name: str):
-    """
-    Read time-series sheet and return daily 'stock' (B-like) and 'cons' (C-like) series.
-    - Detect date/stock/cons columns by name or by numeric content.
-    - Aggregate duplicate dates.
-    - Reindex to full daily range.
-    """
+    """Smart detection of date/stock/cons columns; aggregates duplicates; daily reindex."""
     df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet_name)
-
     cols = list(df.columns)
 
-    # --- detect date column by convertibility ---
+    # detect date column
     dt_scores = {}
     for c in cols:
         try:
@@ -370,55 +361,36 @@ def _fc_daily_B_and_C(xls_bytes: bytes, sheet_name: str):
             dt_scores[c] = 0.0
     date_col = max(dt_scores, key=dt_scores.get) if dt_scores else cols[0]
     dates = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
+    if dates.isna().all():
+        raise ValueError(f"Feuille '{sheet_name}': aucune date exploitable.")
 
-    # --- candidate numeric columns (except date) ---
     numeric_candidates = [c for c in cols if c != date_col]
     parsed = {c: _parse_num_locale(df[c]) for c in numeric_candidates}
     totals = {c: float(parsed[c].abs().sum()) for c in numeric_candidates}
 
     def _score_name(c: str) -> int:
         lc = str(c).lower()
-        if any(k in lc for k in ["cons", "qté", "qte", "quant", "demand"]): return 2  # consumption
-        if any(k in lc for k in ["stock", "receipt", "récept", "recept", "on_hand"]): return 1  # stock/receipts
+        if any(k in lc for k in ["cons", "qté", "qte", "quant", "demand"]): return 2
+        if any(k in lc for k in ["stock", "receipt", "récept", "recept", "on_hand"]): return 1
         return 0
 
     ranked = sorted(numeric_candidates, key=lambda c: (_score_name(c), totals[c]), reverse=True)
 
-    cons_col = None
-    for c in ranked:
-        if _score_name(c) == 2:
-            cons_col = c; break
-    if cons_col is None and ranked:
-        cons_col = ranked[0]
+    cons_col = next((c for c in ranked if _score_name(c) == 2), ranked[0] if ranked else None)
+    stock_col = next((c for c in ranked if c != cons_col and _score_name(c) == 1),
+                     next((c for c in ranked if c != cons_col), None))
 
-    stock_col = None
-    for c in ranked:
-        if c != cons_col and _score_name(c) == 1:
-            stock_col = c; break
-    if stock_col is None:
-        for c in ranked:
-            if c != cons_col:
-                stock_col = c; break
-
-    if dates.isna().all():
-        raise ValueError(f"Feuille '{sheet_name}': aucune date exploitable.")
     if cons_col is None or stock_col is None:
-        fallback = [c for c in cols[:3] if c != date_col]
-        if len(fallback) >= 2:
-            stock_col, cons_col = fallback[0], fallback[1]
-        else:
-            raise ValueError(f"Feuille '{sheet_name}': colonnes stock/cons introuvables.")
+        fb = [c for c in cols[:3] if c != date_col]
+        if len(fb) >= 2: stock_col, cons_col = fb[0], fb[1]
+        else: raise ValueError(f"Feuille '{sheet_name}': colonnes stock/cons introuvables.")
 
     stock = parsed.get(stock_col, _parse_num_locale(df[stock_col]))
     cons  = parsed.get(cons_col,  _parse_num_locale(df[cons_col]))
 
-    g = (
-        pd.DataFrame({"date": dates, "b": stock, "c": cons})
-        .dropna(subset=["date"])
-        .groupby("date", as_index=True)[["b", "c"]]
-        .sum()
-        .sort_index()
-    )
+    g = (pd.DataFrame({"date": dates, "b": stock, "c": cons})
+         .dropna(subset=["date"]).groupby("date", as_index=True)[["b", "c"]].sum().sort_index())
+
     if g.empty:
         raise ValueError(f"Feuille '{sheet_name}': aucune ligne exploitable après agrégation.")
 
@@ -485,6 +457,25 @@ def _fc_compute_metrics(df_run: pd.DataFrame):
     ME = e.mean(); absME = e.abs().mean(); MSE = (e**2).mean(); RMSE = np.sqrt(MSE)
     return ME, absME, MSE, RMSE
 
+# ---- NB quantile fallback (works without SciPy) ----
+def _nb_rop_quantile(mean_, var_, service_level, nb_sim, rng):
+    """
+    Quantile of NB(mean, var) via Gamma–Poisson mixture.
+    mean_ >= 0, var_ >= mean_ (enforce slight overdispersion).
+    """
+    mean_ = float(max(mean_, 0.0))
+    var_  = float(max(var_, mean_ + 1e-9))
+    if mean_ == 0.0:
+        return 0.0
+    p = min(max(mean_ / var_, 1e-12), 1.0 - 1e-12)
+    r = (mean_**2) / (var_ - mean_) if var_ > mean_ else 1e6
+    if not np.isfinite(r) or r <= 1e-9:
+        return 0.0
+    scale = (1.0 - p) / p
+    lam = rng.gamma(shape=r, scale=scale, size=int(nb_sim))
+    y = rng.poisson(lam)
+    return float(np.percentile(y, 100.0 * float(service_level)))
+
 def _fc_rolling_with_rops_single_run(
     xls_bytes: bytes,
     xls: pd.ExcelFile,
@@ -526,40 +517,36 @@ def _fc_rolling_with_rops_single_run(
             stock_running_cum += float(stock_on_hand_interval)
 
             can_cover = bool(stock_running_cum >= real_demand)
-            if can_cover:
-                order_qty_policy = 0.5 * real_demand
-                stock_status = "holding"; order_policy = "half_of_interval_demand"
-            else:
-                order_qty_policy = max(real_demand - stock_running_cum, 0.0)
-                stock_status = "rupture"; order_policy = "shortfall_to_cover"
+            order_qty_policy = 0.5 * real_demand if can_cover else max(real_demand - stock_running_cum, 0.0)
+            stock_status = "holding" if can_cover else "rupture"
+            order_policy = "half_of_interval_demand" if can_cover else "shortfall_to_cover"
 
             forecast_for_interval = f * interval
 
+            # --- means & variances over lead times
+            X_Lt = lead_time * f
+            sigma_Lt = sigma_period * np.sqrt(max(lead_time, 1e-9))
+            var_u = sigma_Lt**2 if sigma_Lt**2 > X_Lt else X_Lt + 1e-5
+
+            totalL = lead_time + lead_time_supplier
+            X_Lt_Lw = totalL * f
+            sigma_Lt_Lw = sigma_period * np.sqrt(max(totalL, 1e-9))
+            var_f = sigma_Lt_Lw**2 if sigma_Lt_Lw**2 > X_Lt_Lw else X_Lt_Lw + 1e-5
+
+            # --- ROPs (SciPy if available, else NumPy fallback)
             if _SCIPY_OK:
-                X_Lt = lead_time * f
-                sigma_Lt = sigma_period * np.sqrt(max(lead_time, 1e-9))
-                var_u = sigma_Lt**2 if sigma_Lt**2 > X_Lt else X_Lt + 1e-5
                 p_nb = min(max(X_Lt / var_u, 1e-12), 1 - 1e-12)
                 r_nb = X_Lt**2 / (var_u - X_Lt) if var_u > X_Lt else 1e6
-                ROP_u = float(np.percentile(
-                    nbinom.rvs(r_nb, p_nb, size=nb_sim, random_state=rng), 100 * service_level
-                ))
+                ROP_u = float(np.percentile(nbinom.rvs(r_nb, p_nb, size=nb_sim, random_state=rng), 100 * service_level))
 
-                totalL = lead_time + lead_time_supplier
-                X_Lt_Lw = totalL * f
-                sigma_Lt_Lw = sigma_period * np.sqrt(max(totalL, 1e-9))
-                var_f = sigma_Lt_Lw**2 if sigma_Lt_Lw**2 > X_Lt_Lw else X_Lt_Lw + 1e-5
                 p_nb_f = min(max(X_Lt_Lw / var_f, 1e-12), 1 - 1e-12)
                 r_nb_f = X_Lt_Lw**2 / (var_f - X_Lt_Lw) if var_f > X_Lt_Lw else 1e6
-                ROP_f = float(np.percentile(
-                    nbinom.rvs(r_nb_f, p_nb_f, size=nb_sim, random_state=rng), 100 * service_level
-                ))
+                ROP_f = float(np.percentile(nbinom.rvs(r_nb_f, p_nb_f, size=nb_sim, random_state=rng), 100 * service_level))
             else:
-                X_Lt = lead_time * f
-                X_Lt_Lw = (lead_time + lead_time_supplier) * f
-                ROP_u = np.nan; ROP_f = np.nan
+                ROP_u = _nb_rop_quantile(X_Lt,    var_u, service_level, nb_sim, rng)
+                ROP_f = _nb_rop_quantile(X_Lt_Lw, var_f, service_level, nb_sim, rng)
 
-            rop_carry_running += float((ROP_u if _SCIPY_OK else 0.0) - real_demand)
+            rop_carry_running += float(ROP_u - real_demand)
 
             rows.append({
                 "method": method, "date": test_date.date(), "code": product_code, "interval": int(interval),
@@ -568,7 +555,7 @@ def _fc_rolling_with_rops_single_run(
                 "stock_on_hand_running": float(stock_running_cum),
                 "can_cover_interval": bool(can_cover),
                 "order_qty_policy": float(order_qty_policy),
-                "order_policy": order_policy,  # replaced at display by 'order'
+                "order_policy": order_policy,
                 "forecast_per_period": f,
                 "forecast_for_interval": float(forecast_for_interval),
                 "forecast_error": float(real_demand - forecast_for_interval),
@@ -600,9 +587,7 @@ def _fc_grid_search_and_final_for_method(
     nb_sim: int,
     rng_seed: int,
 ):
-    all_results = []
-    best_rows_per_code = []
-
+    all_results, best_rows_per_code = [], []
     for code in product_codes:
         metrics_rows = []
         for a in alphas:
@@ -615,19 +600,19 @@ def _fc_grid_search_and_final_for_method(
                         service_level=service_level, nb_sim=nb_sim, rng_seed=rng_seed,
                     )
                     ME, absME, MSE, RMSE = _fc_compute_metrics(df_run)
-                    row = {
+                    metrics_rows.append({
                         "code": code, "method": method, "alpha": a, "window_ratio": w, "recalc_interval": itv,
                         "ME": ME, "absME": absME, "MSE": MSE, "RMSE": RMSE, "n_points": len(df_run)
-                    }
-                    metrics_rows.append(row); all_results.append(row)
+                    })
+                    all_results.append(metrics_rows[-1])
 
         df_metrics = pd.DataFrame(metrics_rows)
         best_ME_idx = (df_metrics["absME"]).idxmin() if df_metrics["absME"].notna().any() else None
         best_MSE_idx = (df_metrics["MSE"]).idxmin()   if df_metrics["MSE"].notna().any()  else None
-        best_RMSE_idx = (df_metrics["RMSE"]).idxmin() if df_metrics["RMSE"].notna().any() else None
+        best_RMSE_idx= (df_metrics["RMSE"]).idxmin()  if df_metrics["RMSE"].notna().any() else None
 
-        best_ME = df_metrics.loc[best_ME_idx] if best_ME_idx is not None else None
-        best_MSE = df_metrics.loc[best_MSE_idx] if best_MSE_idx is not None else None
+        best_ME   = df_metrics.loc[best_ME_idx]   if best_ME_idx   is not None else None
+        best_MSE  = df_metrics.loc[best_MSE_idx]  if best_MSE_idx  is not None else None
         best_RMSE = df_metrics.loc[best_RMSE_idx] if best_RMSE_idx is not None else None
 
         best_rows_per_code.append({
@@ -647,16 +632,11 @@ def _fc_grid_search_and_final_for_method(
             "best_RMSE": None if best_RMSE is None else best_RMSE["RMSE"],
             "n_points_used": int(best_RMSE["n_points"]) if best_RMSE is not None else 0,
         })
-
-    df_all = pd.DataFrame(all_results)
-    df_best = pd.DataFrame(best_rows_per_code)
-    return df_all, df_best
+    return pd.DataFrame(all_results), pd.DataFrame(best_rows_per_code)
 
 def _fc_pick_params(row: pd.Series, metric: str):
-    if metric == "best_ME":
-        return row["best_ME_alpha"], row["best_ME_window"], int(row["best_ME_interval"])
-    if metric == "best_MSE":
-        return row["best_MSE_alpha"], row["best_MSE_window"], int(row["best_MSE_interval"])
+    if metric == "best_ME":  return row["best_ME_alpha"],  row["best_ME_window"],  int(row["best_ME_interval"])
+    if metric == "best_MSE": return row["best_MSE_alpha"], row["best_MSE_window"], int(row["best_MSE_interval"])
     return row["best_RMSE_alpha"], row["best_RMSE_window"], int(row["best_RMSE_interval"])
 
 def _fc_final_run_for_best(
@@ -679,8 +659,7 @@ def _display_table_with_order(df_run: pd.DataFrame):
         return pd.DataFrame()
     tbl = df_run.copy()
     tbl["order"] = tbl["order_qty_policy"].round(2)
-    if "order_policy" in tbl.columns:
-        tbl = tbl.drop(columns=["order_policy"])
+    if "order_policy" in tbl.columns: tbl = tbl.drop(columns=["order_policy"])
     cols = [
         "method","date","code","interval",
         "real_demand","stock_on_hand_interval","stock_on_hand_running","can_cover_interval",
@@ -703,14 +682,12 @@ def summarize_hold_vs_rupture(df_run: pd.DataFrame):
     return float(holding), float(rupture), float(share)
 
 def make_service_level_tradeoff_plot(points_df: pd.DataFrame, title: str):
-    if points_df.empty:
-        return None
+    if points_df.empty: return None
     xs = points_df["holding"].values
     ys = points_df["rupture"].values
     order = np.argsort(xs)
     xs, ys = xs[order], ys[order]
     smooth = pd.Series(ys).rolling(window=min(5, max(3, len(ys))), center=True, min_periods=1).mean().values
-
     fig, ax = plt.subplots(figsize=(8, 4.8))
     ax.scatter(xs, ys, s=40, alpha=0.9)
     ax.plot(xs, smooth, linewidth=3)
@@ -730,7 +707,6 @@ nonce = st.session_state["uploader_nonce"]
 
 # ---------- BARRE FIXE ----------
 st.markdown('<div class="fixed-header"><div class="fixed-inner">', unsafe_allow_html=True)
-
 st.markdown('<div class="controls-holder"><div class="controls-right">', unsafe_allow_html=True)
 
 st.markdown('<div class="control">', unsafe_allow_html=True)
@@ -762,8 +738,6 @@ st.markdown('</div>', unsafe_allow_html=True)
 st.markdown('</div></div>', unsafe_allow_html=True)  # fin controls + holder
 st.markdown('</div></div>', unsafe_allow_html=True)  # fin header
 
-# ----------------------------- FIN BARRE FIXE -----------------------------
-
 st.title("Classification minimale — taille/fréquence → CV² & p → méthode")
 
 # ===== Sélection de la feuille (classeur classification) =====
@@ -773,8 +747,7 @@ if uploaded is not None:
         xls = pd.ExcelFile(uploaded)
         noms = [s.lower() for s in xls.sheet_names]
         default_idx = noms.index("classification") if "classification" in noms else 0
-        sheet_name = st.selectbox("Feuille (classeur de classification)",
-                                  options=xls.sheet_names, index=default_idx)
+        sheet_name = st.selectbox("Feuille (classeur de classification)", options=xls.sheet_names, index=default_idx)
     except Exception as e:
         st.error(f"Impossible de lire le classeur : {e}")
 
@@ -816,11 +789,9 @@ def compute_and_show(uploaded, sheet_name, uploaded_opt):
 
     st.markdown("**Graphe — p vs CV² avec seuils (sélection)**")
     if not methods_one.empty:
-        fig = make_plot(methods_one)
-        st.pyplot(fig, use_container_width=True)
+        fig = make_plot(methods_one); st.pyplot(fig, use_container_width=True)
     else:
         st.info("Pas de graphe pour ce produit.")
-
     st.markdown("**Méthode par produit (sélection)**")
     st.dataframe(methods_one.reset_index(), use_container_width=True)
 
@@ -917,8 +888,7 @@ else:
                 rng_seed = st.number_input("RNG seed", min_value=0, value=42, step=1)
 
             if not _SCIPY_OK:
-                st.warning("SciPy non disponible → ROP par loi binomiale négative désactivé (valeurs NaN). "
-                           "La courbe 'service level' nécessite SciPy.")
+                st.warning("SciPy non disponible — ROP via **fallback NumPy** (Gamma–Poisson).")
 
             run = st.button("▶️ Lancer les prévisions (grid search + résumé)")
             if run:
@@ -985,52 +955,49 @@ else:
 
                             # ---- Service-level tradeoff plot: same product/params; SL varies ----
                             st.markdown("### Courbe service level — points (x=holding, y=rupture)")
-                            if not _SCIPY_OK:
-                                st.info("Impossible sans SciPy (ROP non calculé).")
-                            else:
-                                code_for_plot = st.selectbox(
-                                    "Produit pour la courbe", options=sorted(df_best["code"].astype(str).unique()),
-                                    key=f"{m}_plot_code"
-                                )
-                                levels_default = [0.80, 0.85, 0.90, 0.95, 0.975, 0.99]
-                                service_levels = st.multiselect(
-                                    "Niveaux de service à comparer (min. 5)",
-                                    options=[round(x, 3) for x in np.linspace(0.80, 0.995, 20)],
-                                    default=levels_default, key=f"{m}_levels"
-                                )
-                                if code_for_plot and len(service_levels) >= 5:
-                                    pts = []
-                                    for sl in sorted(set(service_levels)):
-                                        df_final = _fc_final_run_for_best(
-                                            xls_bytes=xls_bytes, xls=xls, method=m, df_best=df_best, code=code_for_plot,
-                                            pick_metric=pick_metric, lead_time=int(lead_time),
-                                            lead_time_supplier=int(lead_time_supplier), service_level=float(sl),
-                                            nb_sim=int(nb_sim), rng_seed=int(rng_seed),
-                                        )
-                                        holding, rupture, share = summarize_hold_vs_rupture(df_final)
-                                        pts.append({"service_level": float(sl),
-                                                    "holding": holding, "rupture": rupture,
-                                                    "covered_share": share})
-                                    points_df = pd.DataFrame(pts).sort_values("service_level")
-                                    fig2 = make_service_level_tradeoff_plot(
-                                        points_df, title=f"{m.upper()} — {code_for_plot} — param. optimaux"
+                            code_for_plot = st.selectbox(
+                                "Produit pour la courbe", options=sorted(df_best["code"].astype(str).unique()),
+                                key=f"{m}_plot_code"
+                            )
+                            levels_default = [0.80, 0.85, 0.90, 0.95, 0.975, 0.99]
+                            service_levels = st.multiselect(
+                                "Niveaux de service à comparer (min. 5)",
+                                options=[round(x, 3) for x in np.linspace(0.80, 0.995, 20)],
+                                default=levels_default, key=f"{m}_levels"
+                            )
+                            if code_for_plot and len(service_levels) >= 5:
+                                pts = []
+                                for sl in sorted(set(service_levels)):
+                                    df_final = _fc_final_run_for_best(
+                                        xls_bytes=xls_bytes, xls=xls, method=m, df_best=df_best, code=code_for_plot,
+                                        pick_metric=pick_metric, lead_time=int(lead_time),
+                                        lead_time_supplier=int(lead_time_supplier), service_level=float(sl),
+                                        nb_sim=int(nb_sim), rng_seed=int(rng_seed),
                                     )
-                                    if fig2 is not None:
-                                        st.pyplot(fig2, use_container_width=True)
-                                        st.dataframe(points_df, use_container_width=True)
-                                        st.download_button(
-                                            "Télécharger points (CSV)",
-                                            data=points_df.to_csv(index=False).encode("utf-8"),
-                                            file_name=f"tradeoff_{m}_{code_for_plot}.csv", mime="text/csv"
-                                        )
-                                        pbuf2 = io.BytesIO()
-                                        fig2.savefig(pbuf2, format="png", bbox_inches="tight")
-                                        pbuf2.seek(0)
-                                        st.download_button(
-                                            "Télécharger le graphe (PNG)", data=pbuf2,
-                                            file_name=f"rupture_vs_holding_{m}_{code_for_plot}.png", mime="image/png"
-                                        )
-                                else:
-                                    st.info("Choisissez au moins 5 niveaux de service.")
+                                    holding, rupture, share = summarize_hold_vs_rupture(df_final)
+                                    pts.append({"service_level": float(sl),
+                                                "holding": holding, "rupture": rupture,
+                                                "covered_share": share})
+                                points_df = pd.DataFrame(pts).sort_values("service_level")
+                                fig2 = make_service_level_tradeoff_plot(
+                                    points_df, title=f"{m.upper()} — {code_for_plot} — param. optimaux"
+                                )
+                                if fig2 is not None:
+                                    st.pyplot(fig2, use_container_width=True)
+                                    st.dataframe(points_df, use_container_width=True)
+                                    st.download_button(
+                                        "Télécharger points (CSV)",
+                                        data=points_df.to_csv(index=False).encode("utf-8"),
+                                        file_name=f"tradeoff_{m}_{code_for_plot}.csv", mime="text/csv"
+                                    )
+                                    pbuf2 = io.BytesIO()
+                                    fig2.savefig(pbuf2, format="png", bbox_inches="tight")
+                                    pbuf2.seek(0)
+                                    st.download_button(
+                                        "Télécharger le graphe (PNG)", data=pbuf2,
+                                        file_name=f"rupture_vs_holding_{m}_{code_for_plot}.png", mime="image/png"
+                                    )
+                            else:
+                                st.info("Choisissez au moins 5 niveaux de service.")
         else:
             st.info("Ajoutez un classeur avec des feuilles de type **time serie <CODE>** ou utilisez la sélection manuelle.")
