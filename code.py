@@ -8,7 +8,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# ====== Optional dependency for ROP simulation ======
+# ====== Optional dependency for ROP simulation (we'll wrap it safely) ======
 try:
     from scipy.stats import nbinom
     _SCIPY_OK = True
@@ -457,24 +457,42 @@ def _fc_compute_metrics(df_run: pd.DataFrame):
     ME = e.mean(); absME = e.abs().mean(); MSE = (e**2).mean(); RMSE = np.sqrt(MSE)
     return ME, absME, MSE, RMSE
 
-# ---- NB quantile fallback (works without SciPy) ----
-def _nb_rop_quantile(mean_, var_, service_level, nb_sim, rng):
+# ---- NB quantile via safe wrapper (SciPy if ok, else NumPy Gamma–Poisson) ----
+def _nb_quantile_safe(mean_, var_, service_level, nb_sim, rng):
     """
-    Quantile of NB(mean, var) via Gamma–Poisson mixture.
-    mean_ >= 0, var_ >= mean_ (enforce slight overdispersion).
+    Returns the service-level quantile of a Negative Binomial with
+    given mean and variance. Robust to edge cases; falls back to
+    Gamma–Poisson simulation if SciPy errors.
     """
     mean_ = float(max(mean_, 0.0))
-    var_  = float(max(var_, mean_ + 1e-9))
+    var_  = float(max(var_, mean_ + 1e-9))            # enforce overdispersion
+    sl    = float(np.clip(service_level, 1e-6, 1-1e-6))
+    n_s   = int(max(1, nb_sim))
+
     if mean_ == 0.0:
         return 0.0
-    p = min(max(mean_ / var_, 1e-12), 1.0 - 1e-12)
-    r = (mean_**2) / (var_ - mean_) if var_ > mean_ else 1e6
-    if not np.isfinite(r) or r <= 1e-9:
+
+    # try SciPy first
+    if _SCIPY_OK:
+        try:
+            p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
+            r = float(mean_**2 / (var_ - mean_))
+            if not np.isfinite(r) or r <= 0:
+                raise ValueError("invalid r")
+            sample = nbinom.rvs(r, p, size=n_s, random_state=rng)
+            return float(np.percentile(sample, 100.0 * sl))
+        except Exception:
+            pass  # fall through to NumPy fallback
+
+    # NumPy Gamma–Poisson mixture
+    p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
+    r = float(mean_**2 / (var_ - mean_)) if var_ > mean_ else 1e6
+    if not np.isfinite(r) or r <= 0:
         return 0.0
     scale = (1.0 - p) / p
-    lam = rng.gamma(shape=r, scale=scale, size=int(nb_sim))
+    lam = rng.gamma(shape=r, scale=scale, size=n_s)
     y = rng.poisson(lam)
-    return float(np.percentile(y, 100.0 * float(service_level)))
+    return float(np.percentile(y, 100.0 * sl))
 
 def _fc_rolling_with_rops_single_run(
     xls_bytes: bytes,
@@ -511,6 +529,8 @@ def _fc_rolling_with_rops_single_run(
             fc = _fc_forecast_per_method(train, alpha=alpha, method=method)
             f = float(fc["forecast_per_period"])
             sigma_period = float(pd.Series(train).std(ddof=1))
+            if not np.isfinite(sigma_period):
+                sigma_period = 0.0
 
             real_demand = _fc_interval_sum_next_days(cons_daily,  i, interval)
             stock_on_hand_interval = _fc_interval_sum_next_days(stock_daily, i, interval)
@@ -533,18 +553,9 @@ def _fc_rolling_with_rops_single_run(
             sigma_Lt_Lw = sigma_period * np.sqrt(max(totalL, 1e-9))
             var_f = sigma_Lt_Lw**2 if sigma_Lt_Lw**2 > X_Lt_Lw else X_Lt_Lw + 1e-5
 
-            # --- ROPs (SciPy if available, else NumPy fallback)
-            if _SCIPY_OK:
-                p_nb = min(max(X_Lt / var_u, 1e-12), 1 - 1e-12)
-                r_nb = X_Lt**2 / (var_u - X_Lt) if var_u > X_Lt else 1e6
-                ROP_u = float(np.percentile(nbinom.rvs(r_nb, p_nb, size=nb_sim, random_state=rng), 100 * service_level))
-
-                p_nb_f = min(max(X_Lt_Lw / var_f, 1e-12), 1 - 1e-12)
-                r_nb_f = X_Lt_Lw**2 / (var_f - X_Lt_Lw) if var_f > X_Lt_Lw else 1e6
-                ROP_f = float(np.percentile(nbinom.rvs(r_nb_f, p_nb_f, size=nb_sim, random_state=rng), 100 * service_level))
-            else:
-                ROP_u = _nb_rop_quantile(X_Lt,    var_u, service_level, nb_sim, rng)
-                ROP_f = _nb_rop_quantile(X_Lt_Lw, var_f, service_level, nb_sim, rng)
+            # --- ROPs via safe wrapper (never crashes)
+            ROP_u = _nb_quantile_safe(X_Lt,    var_u, service_level, nb_sim, rng)
+            ROP_f = _nb_quantile_safe(X_Lt_Lw, var_f, service_level, nb_sim, rng)
 
             rop_carry_running += float(ROP_u - real_demand)
 
@@ -675,7 +686,7 @@ def _display_table_with_order(df_run: pd.DataFrame):
 def summarize_hold_vs_rupture(df_run: pd.DataFrame):
     if df_run.empty:
         return 0.0, 0.0, 0.0
-    diff = (df_run["reorder_point_usine"] - df_run["real_demand"]).astype(float)
+    diff = (df_run["reorder_point_usine"].fillna(0) - df_run["real_demand"]).astype(float)
     holding = diff.clip(lower=0).sum()
     rupture = (-diff).clip(lower=0).sum()
     share = (diff >= 0).mean()
@@ -942,7 +953,8 @@ else:
                                     nb_sim=int(nb_sim), rng_seed=int(rng_seed),
                                 )
                                 tbl = _display_table_with_order(df_final_table)
-                                if tbl.empty or (tbl[["real_demand","stock_on_hand_interval","forecast_for_interval"]].sum().sum() == 0):
+                                if tbl.empty or (tbl[["real_demand","stock_on_hand_interval","forecast_for_interval"]]
+                                                 .sum().sum() == 0):
                                     st.warning("Données nulles dans la fenêtre d’évaluation pour ce produit. "
                                                "Vérifiez la colonne C (consommation) et le format des nombres, "
                                                "ou réduisez le window ratio.")
