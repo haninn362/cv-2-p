@@ -508,7 +508,7 @@ def _fc_rolling_with_rops_single_run(
                 "stock_on_hand_running": float(stock_running_cum),
                 "can_cover_interval": bool(can_cover),
                 "order_qty_policy": float(order_qty_policy),
-                "order_policy": order_policy,
+                "order_policy": order_policy,  # will be replaced in display table
                 "forecast_per_period": f,
                 "forecast_for_interval": float(forecast_for_interval),
                 "forecast_error": float(real_demand - forecast_for_interval),
@@ -592,7 +592,7 @@ def _fc_grid_search_and_final_for_method(
     df_best = pd.DataFrame(best_rows_per_code)
     return df_all, df_best
 
-# ----- Helpers to run final for best params and plot rupture vs holding -----
+# ----- Pick best params; display table with 'order' column -----
 def _fc_pick_params(row: pd.Series, metric: str):
     if metric == "best_ME":
         return row["best_ME_alpha"], row["best_ME_window"], int(row["best_ME_interval"])
@@ -615,34 +615,64 @@ def _fc_final_run_for_best(
         service_level=service_level, nb_sim=nb_sim, rng_seed=rng_seed,
     )
 
-def make_rupture_holding_plot(df_run: pd.DataFrame, title: str):
+def _display_table_with_order(df_run: pd.DataFrame):
+    """Create display table: replace 'order_policy' with 'order' (qty)."""
+    if df_run.empty:
+        return pd.DataFrame()
+    tbl = df_run.copy()
+    tbl["order"] = tbl["order_qty_policy"].round(2)
+    if "order_policy" in tbl.columns:
+        tbl = tbl.drop(columns=["order_policy"])
+    # Select/arrange columns for readability
+    cols = [
+        "method","date","code","interval",
+        "real_demand","stock_on_hand_interval","stock_on_hand_running","can_cover_interval",
+        "order",
+        "forecast_per_period","forecast_for_interval","forecast_error",
+        "X_Lt","reorder_point_usine","lead_time_usine_days",
+        "lead_time_supplier_days","X_Lt_Lw","reorder_point_fournisseur",
+        "stock_status","z_t","p_t"
+    ]
+    cols = [c for c in cols if c in tbl.columns]
+    return tbl[cols]
+
+# ----- Service level trade-off (points for same product & params; SL varies) -----
+def summarize_hold_vs_rupture(df_run: pd.DataFrame):
     """
-    x = stock sufficiency margin (stock_running - real_demand).
-    y = rupture deficit = max(real_demand - stock_running, 0).
+    Holding = sum(max(ROP - demand, 0))
+    Rupture = sum(max(demand - ROP, 0))
+    Also return share_covered = mean(ROP >= demand)
     """
     if df_run.empty:
-        return None
-    suff = df_run["stock_on_hand_running"] - df_run["real_demand"]
-    deficit = (df_run["real_demand"] - df_run["stock_on_hand_running"]).clip(lower=0)
-    mask = suff.notna() & deficit.notna()
-    x = suff[mask].values
-    y = deficit[mask].values
-    if len(x) == 0:
-        return None
+        return 0.0, 0.0, 0.0
+    diff = (df_run["reorder_point_usine"] - df_run["real_demand"]).astype(float)
+    holding = diff.clip(lower=0).sum()
+    rupture = (-diff).clip(lower=0).sum()
+    share = (diff >= 0).mean()
+    return float(holding), float(rupture), float(share)
 
-    order = np.argsort(x)
-    xs = x[order]; ys = y[order]
-    # smooth via centered rolling mean on sorted points
-    k = max(3, len(xs)//8)
-    smooth = pd.Series(ys).rolling(window=k, center=True, min_periods=1).mean().values
+def make_service_level_tradeoff_plot(points_df: pd.DataFrame, title: str):
+    """
+    points_df: columns = service_level, holding, rupture
+    x = holding, y = rupture
+    """
+    if points_df.empty:
+        return None
+    xs = points_df["holding"].values
+    ys = points_df["rupture"].values
+    order = np.argsort(xs)
+    xs, ys = xs[order], ys[order]
+    # simple smoothing over the few points
+    smooth = pd.Series(ys).rolling(window=min(5, max(3, len(ys))), center=True, min_periods=1).mean().values
 
     fig, ax = plt.subplots(figsize=(8, 4.8))
-    ax.scatter(xs, ys, s=18, alpha=0.75)
+    ax.scatter(xs, ys, s=40, alpha=0.9)
     ax.plot(xs, smooth, linewidth=3)
-    ax.axvline(0, linestyle="--", alpha=0.5)
+    for i, row in points_df.iloc[order].reset_index(drop=True).iterrows():
+        ax.annotate(f"SL={row['service_level']:.3f}", (xs[i], ys[i]), textcoords="offset points", xytext=(6, 6))
+    ax.set_xlabel("holding  = Σ max(ROP - demande, 0)")
+    ax.set_ylabel("rupture  = Σ max(demande - ROP, 0)")
     ax.set_title(title)
-    ax.set_xlabel("holding  ⟶  (marge de stock = stock cumulé - demande intervalle)")
-    ax.set_ylabel("rupture  (déficit attendu sur l’intervalle)")
     ax.grid(alpha=0.15)
     fig.tight_layout()
     return fig
@@ -836,13 +866,13 @@ else:
             with c_right:
                 lead_time = st.number_input("Lead time usine (jours)", min_value=0, value=1, step=1)
                 lead_time_supplier = st.number_input("Lead time fournisseur + (jours)", min_value=0, value=3, step=1)
-                service_level = st.slider("Niveau de service", 0.50, 0.999, 0.95, 0.001)
+                base_service_level = st.slider("Niveau de service (table détaillée)", 0.50, 0.999, 0.95, 0.001)
                 nb_sim = st.number_input("Taille simulation NB", min_value=100, step=100, value=1000)
                 rng_seed = st.number_input("RNG seed", min_value=0, value=42, step=1)
 
             if not _SCIPY_OK:
                 st.warning("SciPy non disponible → ROP par loi binomiale négative désactivé (valeurs NaN). "
-                           "Ajoutez `scipy` à vos dépendances pour l’activer.")
+                           "La courbe 'service level' nécessite SciPy.")
 
             run = st.button("▶️ Lancer les prévisions (grid search + résumé)")
             if run:
@@ -860,7 +890,7 @@ else:
                                     method=m, pick_metric=pick_metric, alphas=alphas,
                                     window_ratios=window_ratios, intervals=recalc_intervals,
                                     lead_time=int(lead_time), lead_time_supplier=int(lead_time_supplier),
-                                    service_level=float(service_level), nb_sim=int(nb_sim), rng_seed=int(rng_seed),
+                                    service_level=float(base_service_level), nb_sim=int(nb_sim), rng_seed=int(rng_seed),
                                 )
 
                             c1, c2 = st.columns([2,1], vertical_alignment="top")
@@ -882,28 +912,70 @@ else:
                                 file_name=f"grid_search_{m}.csv", mime="text/csv",
                             )
 
-                            # ---- New plot: rupture vs holding (best params) ----
-                            st.markdown("### Courbe « rupture » vs « holding » (meilleurs paramètres)")
-                            code_for_plot = st.selectbox(
-                                "Produit pour le graphe", options=sorted(df_best["code"].astype(str).unique()),
-                                key=f"{m}_plot_code"
+                            # ---- Detailed table for one product (with 'order' column) ----
+                            st.markdown("### Table détaillée (meilleurs paramètres) avec **order**")
+                            code_for_table = st.selectbox(
+                                "Produit pour la table détaillée", options=sorted(df_best["code"].astype(str).unique()),
+                                key=f"{m}_table_code"
                             )
-                            if code_for_plot:
-                                df_final = _fc_final_run_for_best(
-                                    xls_bytes=xls_bytes, xls=xls, method=m, df_best=df_best, code=code_for_plot,
+                            if code_for_table:
+                                df_final_table = _fc_final_run_for_best(
+                                    xls_bytes=xls_bytes, xls=xls, method=m, df_best=df_best, code=code_for_table,
                                     pick_metric=pick_metric, lead_time=int(lead_time),
-                                    lead_time_supplier=int(lead_time_supplier), service_level=float(service_level),
+                                    lead_time_supplier=int(lead_time_supplier), service_level=float(base_service_level),
                                     nb_sim=int(nb_sim), rng_seed=int(rng_seed),
                                 )
-                                if df_final.empty:
-                                    st.info("Pas assez de points pour tracer ce produit avec les meilleurs paramètres.")
+                                tbl = _display_table_with_order(df_final_table)
+                                if tbl.empty:
+                                    st.info("Pas assez de points pour ce produit.")
                                 else:
-                                    fig2 = make_rupture_holding_plot(
-                                        df_final, title=f"{m.upper()} — {code_for_plot} ({pick_metric})"
+                                    st.dataframe(tbl, use_container_width=True)
+                                    st.download_button(
+                                        "Télécharger la table (CSV)",
+                                        data=tbl.to_csv(index=False).encode("utf-8"),
+                                        file_name=f"details_{m}_{code_for_table}.csv", mime="text/csv"
+                                    )
+
+                            # ---- Service-level tradeoff plot: points for same product, SL varies ----
+                            st.markdown("### Courbe service level — points (x=holding, y=rupture)")
+                            if not _SCIPY_OK:
+                                st.info("Impossible sans SciPy (ROP non calculé).")
+                            else:
+                                code_for_plot = st.selectbox(
+                                    "Produit pour la courbe", options=sorted(df_best["code"].astype(str).unique()),
+                                    key=f"{m}_plot_code"
+                                )
+                                levels_default = [0.80, 0.85, 0.90, 0.95, 0.975, 0.99]
+                                service_levels = st.multiselect(
+                                    "Niveaux de service à comparer (min. 5)",
+                                    options=[round(x, 3) for x in np.linspace(0.80, 0.995, 20)],
+                                    default=levels_default, key=f"{m}_levels"
+                                )
+                                if code_for_plot and len(service_levels) >= 5:
+                                    pts = []
+                                    for sl in sorted(set(service_levels)):
+                                        df_final = _fc_final_run_for_best(
+                                            xls_bytes=xls_bytes, xls=xls, method=m, df_best=df_best, code=code_for_plot,
+                                            pick_metric=pick_metric, lead_time=int(lead_time),
+                                            lead_time_supplier=int(lead_time_supplier), service_level=float(sl),
+                                            nb_sim=int(nb_sim), rng_seed=int(rng_seed),
+                                        )
+                                        holding, rupture, share = summarize_hold_vs_rupture(df_final)
+                                        pts.append({"service_level": float(sl),
+                                                    "holding": holding, "rupture": rupture,
+                                                    "covered_share": share})
+                                    points_df = pd.DataFrame(pts).sort_values("service_level")
+                                    fig2 = make_service_level_tradeoff_plot(
+                                        points_df, title=f"{m.upper()} — {code_for_plot} — param. optimaux"
                                     )
                                     if fig2 is not None:
                                         st.pyplot(fig2, use_container_width=True)
-                                        # download
+                                        st.dataframe(points_df, use_container_width=True)
+                                        st.download_button(
+                                            "Télécharger points (CSV)",
+                                            data=points_df.to_csv(index=False).encode("utf-8"),
+                                            file_name=f"tradeoff_{m}_{code_for_plot}.csv", mime="text/csv"
+                                        )
                                         pbuf2 = io.BytesIO()
                                         fig2.savefig(pbuf2, format="png", bbox_inches="tight")
                                         pbuf2.seek(0)
@@ -911,7 +983,7 @@ else:
                                             "Télécharger le graphe (PNG)", data=pbuf2,
                                             file_name=f"rupture_vs_holding_{m}_{code_for_plot}.png", mime="image/png"
                                         )
-                                    else:
-                                        st.info("Impossible de générer le graphe (données insuffisantes).")
+                                else:
+                                    st.info("Choisissez au moins 5 niveaux de service.")
         else:
             st.info("Ajoutez un classeur avec des feuilles de type **time serie <CODE>** ou utilisez la sélection manuelle.")
