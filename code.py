@@ -8,7 +8,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# ===== Optional SciPy for NB; we fall back to NumPy if missing
+# ===== SciPy NB (primary path) + safe fallback
 try:
     from scipy.stats import nbinom
     _SCIPY_OK = True
@@ -309,11 +309,8 @@ def _parse_num_locale(series) -> pd.Series:
     v1 = pd.to_numeric(s, errors="coerce")
     if v1.notna().mean() >= 0.60:
         return v1.fillna(0.0).astype(float)
-    s2 = (s.astype(str)
-            .str.replace("\u00A0", "", regex=False)
-            .str.replace(" ", "", regex=False))
-    s2b = (s2.str.replace(".", "", regex=False)
-              .str.replace(",", ".", regex=False))
+    s2 = (s.astype(str).str.replace("\u00A0", "", regex=False).str.replace(" ", "", regex=False))
+    s2b = (s2.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
     v2 = pd.to_numeric(s2b, errors="coerce")
     return v2.fillna(0.0).astype(float)
 
@@ -348,7 +345,7 @@ def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
 
 def _fc_daily_B_and_C_simple(xls_bytes: bytes, sheet_name: str):
     """
-    Strict reader like your original:
+    Strict reader like the original:
       A: date, B: stock_on_hand / receipts, C: qté consommée
     """
     df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet_name)
@@ -433,35 +430,32 @@ def _fc_compute_metrics(df_run: pd.DataFrame):
     ME = e.mean(); absME = e.abs().mean(); MSE = (e**2).mean(); RMSE = np.sqrt(MSE)
     return ME, absME, MSE, RMSE
 
-# ---- NB quantile: safe wrapper (SciPy if ok, else NumPy Gamma–Poisson) ----
-def _nb_quantile_safe(mean_, var_, service_level, nb_sim, rng):
+# ---- Safe fallback when SciPy isn't available (Gamma-Poisson) ----
+def _nb_quantile_fallback(mean_, var_, service_level, nb_sim, rng):
     mean_ = float(max(mean_, 0.0))
     var_  = float(max(var_, mean_ + 1e-9))            # enforce overdispersion
-    sl    = float(np.clip(service_level, 1e-6, 1-1e-6))
-    n_s   = int(max(1, nb_sim))
-
-    if mean_ == 0.0:
-        return 0.0
-
-    if _SCIPY_OK:
-        try:
-            p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
-            r = float(mean_**2 / (var_ - mean_))
-            if not np.isfinite(r) or r <= 0:
-                raise ValueError("invalid r")
-            sample = nbinom.rvs(r, p, size=n_s, random_state=rng)
-            return float(np.percentile(sample, 100.0 * sl))
-        except Exception:
-            pass  # fallback
-
+    if mean_ == 0.0: return 0.0
+    sl = float(np.clip(service_level, 1e-6, 1 - 1e-6))
     p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
     r = float(mean_**2 / (var_ - mean_)) if var_ > mean_ else 1e6
-    if not np.isfinite(r) or r <= 0:
-        return 0.0
-    scale = (1.0 - p) / p
-    lam = rng.gamma(shape=r, scale=scale, size=n_s)
+    if not np.isfinite(r) or r <= 0: return 0.0
+    lam = rng.gamma(shape=r, scale=(1.0 - p) / p, size=int(max(1, nb_sim)))
     y = rng.poisson(lam)
     return float(np.percentile(y, 100.0 * sl))
+
+def _nbinom_quantile_scipy(mean_, var_, service_level, nb_sim, rng):
+    """
+    EXACT mapping you had originally:
+      p = mean / var ; r = mean^2 / (var - mean)
+      sample ~ NB(r, p) ; quantile at service_level
+    """
+    mean_ = float(max(mean_, 0.0))
+    var_  = float(max(var_, mean_ + 1e-9))
+    if mean_ == 0.0: return 0.0
+    p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
+    r = float(mean_**2 / (var_ - mean_)) if var_ > mean_ else 1e6
+    sample = nbinom.rvs(r, p, size=int(max(1, nb_sim)), random_state=rng)
+    return float(np.percentile(sample, 100.0 * float(service_level)))
 
 def _fc_rolling_with_rops_single_run(
     xls_bytes: bytes,
@@ -478,7 +472,6 @@ def _fc_rolling_with_rops_single_run(
     rng_seed: int,
 ):
     sheet = _fc_find_product_sheet(xls, product_code)
-    # Use strict 3-column reader; if anything fails, fall back to smart parser (not shown here).
     stock_daily, cons_daily = _fc_daily_B_and_C_simple(xls_bytes, sheet)
 
     vals = cons_daily.values
@@ -509,11 +502,10 @@ def _fc_rolling_with_rops_single_run(
             can_cover = bool(stock_running_cum >= real_demand)
             order_qty_policy = 0.5 * real_demand if can_cover else max(real_demand - stock_running_cum, 0.0)
             stock_status = "holding" if can_cover else "rupture"
-            order_policy = "half_of_interval_demand" if can_cover else "shortfall_to_cover"
 
             forecast_for_interval = f * interval
 
-            # --- means & variances over lead times
+            # --- mean/var over lead times
             X_Lt = lead_time * f
             sigma_Lt = sigma_period * np.sqrt(max(lead_time, 1e-9))
             var_u = sigma_Lt**2 if sigma_Lt**2 > X_Lt else X_Lt + 1e-5
@@ -523,9 +515,13 @@ def _fc_rolling_with_rops_single_run(
             sigma_Lt_Lw = sigma_period * np.sqrt(max(totalL, 1e-9))
             var_f = sigma_Lt_Lw**2 if sigma_Lt_Lw**2 > X_Lt_Lw else X_Lt_Lw + 1e-5
 
-            # --- ROPs via safe wrapper (never crashes)
-            ROP_u = _nb_quantile_safe(X_Lt,    var_u, service_level, nb_sim, rng)
-            ROP_f = _nb_quantile_safe(X_Lt_Lw, var_f, service_level, nb_sim, rng)
+            # --- ROPs (SciPy path = identical to your Colab; else fallback)
+            if _SCIPY_OK:
+                ROP_u = _nbinom_quantile_scipy(X_Lt,    var_u, service_level, nb_sim, rng)
+                ROP_f = _nbinom_quantile_scipy(X_Lt_Lw, var_f, service_level, nb_sim, rng)
+            else:
+                ROP_u = _nb_quantile_fallback(X_Lt,    var_u, service_level, nb_sim, rng)
+                ROP_f = _nb_quantile_fallback(X_Lt_Lw, var_f, service_level, nb_sim, rng)
 
             rop_carry_running += float(ROP_u - real_demand)
 
@@ -535,8 +531,7 @@ def _fc_rolling_with_rops_single_run(
                 "stock_on_hand_interval": float(stock_on_hand_interval),
                 "stock_on_hand_running": float(stock_running_cum),
                 "can_cover_interval": bool(can_cover),
-                "order_qty_policy": float(order_qty_policy),
-                "order_policy": order_policy,
+                "order_qty_policy": float(order_qty_policy),  # will become 'order' in display
                 "forecast_per_period": f,
                 "forecast_for_interval": float(forecast_for_interval),
                 "forecast_error": float(real_demand - forecast_for_interval),
@@ -640,7 +635,8 @@ def _display_table_with_order(df_run: pd.DataFrame):
         return pd.DataFrame()
     tbl = df_run.copy()
     tbl["order"] = tbl["order_qty_policy"].round(2)
-    if "order_policy" in tbl.columns: tbl = tbl.drop(columns=["order_policy"])
+    if "order_policy" in tbl.columns:
+        tbl = tbl.drop(columns=["order_policy"])
     cols = [
         "method","date","code","interval",
         "real_demand","stock_on_hand_interval","stock_on_hand_running","can_cover_interval",
@@ -860,7 +856,7 @@ else:
                 rng_seed = st.number_input("RNG seed", min_value=0, value=42, step=1)
 
             if not _SCIPY_OK:
-                st.warning("SciPy non disponible — ROP via **fallback NumPy** (Gamma–Poisson).")
+                st.warning("SciPy non disponible — ROP via **fallback Gamma–Poisson** (légères différences).")
 
             run = st.button("▶️ Lancer les prévisions (grid search + résumé)")
             if run:
@@ -932,9 +928,9 @@ else:
                                 "Produit pour la courbe", options=sorted(df_best["code"].astype(str).unique()),
                                 key=f"{m}_plot_code"
                             )
-                            # Build options and defaults so defaults are ALWAYS in options
-                            options_levels = [round(float(x), 3) for x in np.linspace(0.80, 0.995, 20)]
-                            default_idx = [0, 3, 6, 9, 12, 15]  # 6 values, spaced
+                            # Build options from a single list; defaults drawn from that exact list (no float mismatch)
+                            options_levels = [float(x) for x in np.linspace(0.80, 0.995, 20)]
+                            default_idx = [0, 3, 6, 9, 12, 15]  # 6 spaced values
                             levels_default = [options_levels[i] for i in default_idx if i < len(options_levels)]
                             service_levels = st.multiselect(
                                 "Niveaux de service à comparer (min. 5)",
