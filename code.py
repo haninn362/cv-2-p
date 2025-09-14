@@ -441,3 +441,90 @@ if uploaded is not None and sheet_name is not None:
         st.error(f"Échec du traitement : {e}")
 else:
     st.info("Téléversez d’abord le classeur de classification. (Vous pouvez aussi téléverser un classeur d’optimisation séparé.)")
+
+# ============================================
+# Unified Script: SBA + Croston + SES (unique names per method)
+# Grid Search (ME, MSE, RMSE) + Final Recalc (display only selected columns)
+# ============================================
+
+import re
+import numpy as np
+import pandas as pd
+from scipy.stats import nbinom
+import streamlit as st
+
+# ---------- GLOBAL PARAMETERS ----------
+EXCEL_PATH_UNI = None   # will be set from uploaded file
+PRODUCT_CODES_UNI = ["EM0400", "EM1499", "EM1091", "EM1523", "EM0392", "EM1526"]
+
+# Optimized Grid Search (balanced speed/coverage)
+ALPHAS_UNI = [0.05, 0.1, 0.15, 0.2, 0.3, 0.4]
+WINDOW_RATIOS_UNI = [0.6, 0.7, 0.8]
+RECALC_INTERVALS_UNI = [1, 2, 5, 10, 15, 20]
+
+# Supply / ROP
+LEAD_TIME_UNI = 1
+LEAD_TIME_SUPPLIER_UNI = 3
+SERVICE_LEVEL_UNI = 0.95
+NB_SIM_UNI = 800
+RNG_SEED_UNI = 42
+
+# Desired final columns to display
+DISPLAY_COLUMNS_UNI = [
+    "date", "code", "interval", "real_demand", "stock_on_hand_running",
+    "stock_after_interval", "can_cover_interval", "order_policy",
+    "reorder_point_usine", "lead_time_usine_days", "lead_time_supplier_days",
+    "reorder_point_fournisseur", "stock_status", "rop_usine_minus_real_running"
+]
+
+# =====================================================================
+# [Keep ALL your SBA / Croston / SES functions exactly as-is here]
+# =====================================================================
+
+# (⚠️ Copy all the functions from your script here unchanged:
+#   _find_product_sheet_sba, _daily_consumption_and_stock_sba, 
+#   rolling_sba_with_rops_single_run, compute_metrics_sba, _grid_and_final_sba,
+#   ... same for Croston and SES
+#   up to _grid_and_final_ses
+# )
+
+# =====================================================================
+# =======================  RUN ALL SECTIONS (Streamlit) ===============
+# =====================================================================
+
+st.header("Prévisions & ROP — SBA / Croston / SES")
+
+uploaded_forecast = st.file_uploader(
+    "Classeur Excel (Prévisions & ROP)", type=["xlsx", "xls"], key="forecast_file",
+    help="Doit contenir les feuilles 'time serie <CODE>' pour chaque produit."
+)
+
+if uploaded_forecast is not None:
+    EXCEL_PATH_UNI = uploaded_forecast
+
+    # SBA
+    st.subheader("SBA")
+    df_best_sba = _grid_and_final_sba()
+
+    # Croston
+    st.subheader("Croston")
+    df_best_croston = _grid_and_final_croston()
+
+    # SES
+    st.subheader("SES")
+    df_best_ses = _grid_and_final_ses()
+
+    # Comparison placeholder
+    st.markdown("**Résumé comparatif (à compléter selon besoin)**")
+    comp = {
+        "SBA": df_best_sba,
+        "Croston": df_best_croston,
+        "SES": df_best_ses
+    }
+    for method, df_best in comp.items():
+        if df_best is not None and not df_best.empty:
+            st.write(f"Best params for {method}")
+            st.dataframe(df_best, use_container_width=True)
+
+else:
+    st.info("📂 Téléversez le classeur contenant les feuilles 'time serie <CODE>' pour lancer les prévisions.")
