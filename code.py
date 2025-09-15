@@ -833,3 +833,107 @@ else:
                                 )
                         else:
                             st.info("Pas de 'best' trouvé pour cette méthode / ces codes — vérifiez les données.")
+# ============================================================
+# Build Two Comparison Tables: Mean Holding & CT
+# ============================================================
+
+st.markdown("---")
+st.header("📊 Comparaison: Mean Holding & CT (par méthode et niveau de service)")
+
+# ---- Parameters for CT formula ----
+A_w, A_R = 50, 70
+pi, tau = 1.0, 1.0
+T_w = 1.0
+C_w, C_R = 5.0, 8.0  # so C_R' = 3
+
+def compute_ct(D, Qw, Qr):
+    Iw_prime = Qw / 2.0
+    Ir_prime = Qr / 2.0
+    Cw_prime = C_w
+    Cr_prime = C_R - C_w
+    return (
+        A_w * (D / Qw if Qw > 0 else 0)
+        + pi * T_w * Cw_prime * Iw_prime
+        + A_R * (D / Qr if Qr > 0 else 0)
+        + tau * Cr_prime * Ir_prime
+    )
+
+SERVICE_LEVELS = [0.90, 0.92, 0.95, 0.98]
+
+records_holding, records_ct = [], []
+
+# Loop over best combos from SBA, Croston, SES
+for method_name, df_best in [
+    ("SBA", df_best_sba),
+    ("Croston", df_best_croston),
+    ("SES", df_best_ses),
+]:
+    if df_best is None or df_best.empty:
+        continue
+
+    for _, r in df_best.iterrows():
+        code = r["code"]
+        alpha, w, itv = r["alpha"], r["window_ratio"], r["recalc_interval"]
+
+        for sl in SERVICE_LEVELS:
+            df_run = _rolling_with_rops_single_run(
+                excel_like=io.BytesIO(xls_bytes),
+                product_code=code,
+                method=method_name.lower(),
+                alpha=float(alpha), window_ratio=float(w), interval=int(itv),
+                lead_time=int(lead_time),
+                lead_time_supplier=int(lead_time_supplier),
+                service_level=sl, nb_sim=int(nb_sim), rng_seed=int(rng_seed),
+            )
+
+            if df_run.empty:
+                mean_holding_val, CT_val = np.nan, np.nan
+            else:
+                mean_holding_val = df_run.loc[
+                    df_run["stock_status"] == "holding",
+                    "rop_usine_minus_real_running"
+                ].mean()
+
+                D = df_run["real_demand"].sum()
+                Qw = df_run["reorder_point_fournisseur"].mean()
+                Qr = df_run["reorder_point_usine"].mean()
+                CT_val = compute_ct(D, Qw, Qr)
+
+            records_holding.append({
+                "product": code,
+                "method": method_name,
+                "service_level": f"{int(sl*100)}%",
+                "Mean_Holding": mean_holding_val,
+            })
+            records_ct.append({
+                "product": code,
+                "method": method_name,
+                "service_level": f"{int(sl*100)}%",
+                "CT": CT_val,
+            })
+
+# ---- Pivot into two final tables ----
+df_holding = pd.DataFrame(records_holding)
+df_ct = pd.DataFrame(records_ct)
+
+if not df_holding.empty:
+    table_holding = df_holding.pivot_table(
+        index="product", columns=["method", "service_level"], values="Mean_Holding"
+    )
+    st.subheader("📊 Table de comparaison — Mean Holding")
+    st.dataframe(table_holding)
+    st.download_button("Télécharger (Holding) CSV",
+                       data=table_holding.to_csv().encode("utf-8"),
+                       file_name="comparison_mean_holding.csv",
+                       mime="text/csv")
+
+if not df_ct.empty:
+    table_ct = df_ct.pivot_table(
+        index="product", columns=["method", "service_level"], values="CT"
+    )
+    st.subheader("💰 Table de comparaison — CT")
+    st.dataframe(table_ct)
+    st.download_button("Télécharger (CT) CSV",
+                       data=table_ct.to_csv().encode("utf-8"),
+                       file_name="comparison_ct.csv",
+                       mime="text/csv")
