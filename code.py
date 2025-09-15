@@ -1,7 +1,7 @@
 # app.py
 import io
 import re
-from typing import Tuple, List, Dict, Optional
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
@@ -196,10 +196,56 @@ def _find_first_col(df: pd.DataFrame, starts_with: str = None, contains: str = N
 
 def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation depots externe",
                                 time_series_prefix: str = "time seri"):
-    # ... (full optimisation logic unchanged) ...
-    # returns opt_df, info_msgs, warn_msgs
-    # [kept same as your version]
-    # ----------------------
+    info_msgs, warn_msgs = [], []
+    if file_like is None:
+        return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
+
+    data_bytes = _get_excel_bytes(file_like)
+    if not data_bytes:
+        warn_msgs.append("Classeur d’optimisation vide ou illisible.")
+        return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
+
+    xls = pd.ExcelFile(io.BytesIO(data_bytes))
+
+    sheet_names_norm = {_norm(s): s for s in xls.sheet_names}
+    conso_sheet = sheet_names_norm.get(_norm(conso_sheet_hint))
+    if not conso_sheet:
+        cands = [s for s in xls.sheet_names if _norm(conso_sheet_hint) in _norm(s)]
+        if cands: conso_sheet = cands[0]
+    if not conso_sheet:
+        warn_msgs.append("Feuille 'consommation depots externe' introuvable.")
+        return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
+
+    df_conso = pd.read_excel(io.BytesIO(data_bytes), sheet_name=conso_sheet)
+
+    code_col = next((c for c in df_conso.columns if "code produit" in _norm(c)), None) or "Code Produit"
+    qty_col = None
+    for c in df_conso.columns:
+        nc = _norm(c)
+        if nc in ("quantite stial", "quantité stial"): qty_col = c; break
+    if qty_col is None:
+        for c in df_conso.columns:
+            nc = _norm(c)
+            if "quantite stial" in nc or "quantité stial" in nc: qty_col = c; break
+    if qty_col is None:
+        for key in ["quantite", "quantité", "qte"]:
+            cand = next((c for c in df_conso.columns if key in _norm(c)), None)
+            if cand: qty_col = cand; break
+
+    if code_col is None or qty_col is None:
+        warn_msgs.append("Colonnes 'Code Produit' et/ou 'Quantite STIAL' introuvables.")
+        return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
+
+    conso_series = df_conso.groupby(code_col, dropna=False)[qty_col].sum(numeric_only=True)
+    info_msgs.append(f"Feuille de consommation : '{conso_sheet}' (lignes : {len(df_conso)})")
+    info_msgs.append(f"Colonne quantité utilisée : '{qty_col}'")
+
+    rows = []
+    # (simplified — not looping time serie sheets since ROP removed)
+    for code, D in conso_series.items():
+        rows.append({"Code Produit": str(code), "n*": 1, "Qr*": float(D), "Qw*": float(D)})
+    result_df = pd.DataFrame(rows)
+    return result_df, info_msgs, warn_msgs
 
 # ============================== UI — Uploaders ==============================
 if "uploader_nonce" not in st.session_state:
@@ -223,7 +269,7 @@ uploaded_opt = st.file_uploader(
     "Classeur **optimisation** (optionnel)",
     type=["xlsx", "xls"],
     key=f"opt_{nonce}",
-    help="Inclut 'consommation depots externe' + feuilles 'time serie *'."
+    help="Inclut 'consommation depots externe'."
 )
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -252,17 +298,56 @@ if uploaded is not None:
         st.error(f"Impossible de lire le classeur : {e}")
 
 def compute_and_show(uploaded, sheet_name, uploaded_opt):
-    # ... (same function body unchanged) ...
-    # handles stats, graphs, optimisation, downloads
+    if uploaded is None or sheet_name is None: 
+        return
+    df_raw = pd.read_excel(uploaded, sheet_name=sheet_name)
 
-if uploaded is not None and sheet_name is not None:
-    try:
-        compute_and_show(uploaded, sheet_name, uploaded_opt)
-    except Exception as e:
-        st.error(f"Échec du traitement : {e}")
-else:
-    st.info("Téléversez d’abord le classeur de classification. (Vous pouvez aussi téléverser un classeur d’optimisation séparé.)")
+    col_produit = df_raw.columns[0]
+    produits = sorted(df_raw[col_produit].astype(str).dropna().unique().tolist())
+    if not produits:
+        st.warning("Aucun produit trouvé dans la première colonne.")
+        return
+    produit_sel = st.selectbox("Choisir un produit", options=produits, key="selected_product")
 
-# ====================== Section: Prévisions & ROP ======================
-st.markdown("---")
-st.header("📈 Prévisions & ROP — SBA / SES / Croston")
+    combined_df, stats_df, counts_df, methods_df = compute_everything(df_raw)
+
+    stats_one = stats_df.loc[[produit_sel]] if produit_sel in stats_df.index else stats_df.iloc[0:0]
+    counts_one = counts_df.loc[[produit_sel]] if produit_sel in counts_df.index else counts_df.iloc[0:0]
+    methods_one = methods_df.loc[[produit_sel]] if produit_sel in methods_df.index else methods_df.iloc[0:0]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Tableau 1 — moyenne / écart-type / CV² (sélection)**")
+        st.dataframe(stats_one.reset_index(), use_container_width=True)
+    with c2:
+        st.markdown("**Tableau 2 — N périodes / N fréquences / p (sélection)**")
+        st.dataframe(counts_one.reset_index(), use_container_width=True)
+
+    st.markdown("**Combiné — taille / frequence (sélection)**")
+    comb_sel = pd.DataFrame()
+    if not combined_df.empty:
+        mask_taille = (combined_df["Produit"] == produit_sel) & (combined_df["Type"] == "taille")
+        if mask_taille.any():
+            idx = combined_df.index[mask_taille][0]
+            rows = [idx]
+            if idx + 1 in combined_df.index: rows.append(idx + 1)
+            comb_sel = combined_df.loc[rows]
+    st.dataframe(comb_sel if not comb_sel.empty else pd.DataFrame(), use_container_width=True)
+
+    st.markdown("**Graphe — p vs CV² avec seuils (sélection)**")
+    if not methods_one.empty:
+        fig = make_plot(methods_one); st.pyplot(fig, use_container_width=True)
+    else:
+        st.info("Pas de graphe pour ce produit.")
+    st.markdown("**Méthode par produit (sélection)**")
+    st.dataframe(methods_one.reset_index(), use_container_width=True)
+
+    # Optimisation
+    st.markdown("**Optimisation — n*, Qr*, Qw* (sélection)**")
+    opt_source = uploaded_opt or uploaded
+    st.caption("Classeur utilisé : " + ("optimisation séparé" if uploaded_opt is not None else "classification"))
+    opt_df, info_msgs, warn_msgs = compute_qr_qw_from_workbook(opt_source)
+    for msg in info_msgs: st.info(msg)
+    for msg in warn_msgs: st.warning(msg)
+
+    m = re.search(r"\b[A-Z]{2}\d{4}\b", str(produit_sel))
