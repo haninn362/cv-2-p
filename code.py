@@ -437,6 +437,63 @@ def compute_and_show(uploaded, sheet_name, uploaded_opt):
             mime="text/csv"
         )
 
+# ============================== Forecasting (SBA, Croston, SES) ==============================
+
+def run_forecasts(uploaded_file):
+    if uploaded_file is None:
+        st.info("Téléversez d'abord un fichier Excel pour lancer SBA / Croston / SES.")
+        return
+
+    try:
+        # Load Excel once
+        xls = pd.ExcelFile(uploaded_file)
+        codes = [s.split()[-1] for s in xls.sheet_names if s.lower().startswith("time serie")]
+
+        if not codes:
+            st.warning("Aucune feuille 'time serie *' trouvée dans ce classeur.")
+            return
+
+        # Parameters
+        ALPHAS = [0.1, 0.2, 0.3]
+        WINDOWS = [0.7, 0.8]
+        INTERVALS = [5, 10]
+        LEAD_TIME, LEAD_SUP, SERVICE, NB_SIM = 1, 3, 0.95, 200
+
+        st.header("📈 Prévisions avancées : SBA, Croston, SES")
+
+        for method_name, forecast_func in [
+            ("SBA", lambda vals, a: _croston_or_sba_forecast_array_sba(vals, a, "sba")),
+            ("Croston", _croston_forecast_array_croston),
+            ("SES", _ses_forecast_array_ses),
+        ]:
+            st.subheader(f"📌 {method_name} — meilleurs paramètres")
+            best_rows = []
+
+            for code in codes:
+                best_rmse, best = np.inf, None
+                for a in ALPHAS:
+                    for w in WINDOWS:
+                        for itv in INTERVALS:
+                            try:
+                                df_run = _rolling_method(
+                                    uploaded_file, code, a, w, itv, forecast_func,
+                                    lead_time=LEAD_TIME, lead_time_supplier=LEAD_SUP,
+                                    service_level=SERVICE, nb_sim=NB_SIM
+                                )
+                                if df_run.empty: 
+                                    continue
+                                _, _, _, rmse = compute_metrics_sba(df_run)  # same metric fn
+                                if pd.notna(rmse) and rmse < best_rmse:
+                                    best_rmse = rmse
+                                    best = {"Code": code, "alpha": a, "window": w, "interval": itv, "RMSE": rmse}
+                            except Exception as e:
+                                continue
+                if best: best_rows.append(best)
+
+            df_best = pd.DataFrame(best_rows)
+            st.dataframe(df_best if not df_best.empty else pd.DataFrame([{"Info": "Aucun résultat"}]))
+
+
 if uploaded is not None and sheet_name is not None:
     try:
         compute_and_show(uploaded, sheet_name, uploaded_opt)
