@@ -346,10 +346,9 @@ def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
 def _fc_daily_B_and_C_simple(xls_bytes: bytes, sheet_name: str):
     df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet_name)
 
-    # Normalize column names
-    cols = {c: _norm(str(c)) for c in df.columns}
+    st.write("✅ DEBUG: First rows of the sheet", df.head())  # 👈 add this
 
-    # Try to detect columns by header name
+    cols = {c: _norm(str(c)) for c in df.columns}
     date_col = next((c for c, nc in cols.items() if "date" in nc), df.columns[0])
     cons_col = next((c for c, nc in cols.items() if "cons" in nc or "demande" in nc or "qte" in nc), df.columns[2])
     stock_col = next((c for c, nc in cols.items() if "stock" in nc or "recept" in nc), df.columns[1])
@@ -357,6 +356,8 @@ def _fc_daily_B_and_C_simple(xls_bytes: bytes, sheet_name: str):
     dates = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
     stock = _parse_num_locale(df[stock_col])
     cons  = _parse_num_locale(df[cons_col])
+
+    st.write("✅ DEBUG: Parsed consumption values", cons.head())  # 👈 add this
 
     g = (
         pd.DataFrame({"date": dates, "b": stock, "c": cons})
@@ -366,7 +367,6 @@ def _fc_daily_B_and_C_simple(xls_bytes: bytes, sheet_name: str):
     )
     if g.empty:
         raise ValueError(f"Feuille '{sheet_name}': aucune donnée exploitable.")
-
     full_idx = pd.date_range(g.index.min(), g.index.max(), freq="D")
     stock_daily = g["b"].reindex(full_idx, fill_value=0.0); stock_daily.index.name = "date"
     cons_daily  = g["c"].reindex(full_idx, fill_value=0.0); cons_daily.index.name  = "date"
