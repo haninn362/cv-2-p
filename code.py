@@ -178,7 +178,6 @@ def make_plot(methods_df: pd.DataFrame):
     return fig
 
 
-
 # ========================== Optimisation ==========================
 def _get_excel_bytes(file_like) -> bytes:
     if file_like is None: return b""
@@ -479,7 +478,6 @@ def rolling_croston_with_rops_single_run(
 
 
 
-
 # ========================== Forecasting — SES ==========================
 def _ses_forecast_array(x, alpha: float):
     x = pd.Series(x).fillna(0.0).astype(float).values
@@ -696,7 +694,6 @@ def build_comparison_tables(df_best_sba, df_best_croston, df_best_ses, excel_pat
         index="product", columns=["method", "service_level"], values="CT"
     )
     return table_holding, table_ct
-
 
 
 
