@@ -1,11 +1,4 @@
 # app.py
-# One-file Streamlit app:
-# - Classification (p, CV^2) + visual
-# - Optimisation (n*, Qr*, Qw*) from workbook sheets
-# - Forecasts + ROP via grid search for SBA / Croston / SES
-# - Detailed table for best params (with order column)
-# - Comparison tables: Mean Holding & CT across service levels
-
 import io
 import re
 from typing import Tuple, List, Dict, Optional
@@ -66,9 +59,6 @@ st.markdown(
 )
 
 # ======================== Helpers / Excel I/O =======================
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s).strip().lower())
-
 def _get_excel_bytes(file_like) -> bytes:
     if file_like is None: return b""
     if hasattr(file_like, "getvalue"):
@@ -91,6 +81,8 @@ def choose_method(p: float, cv2: float) -> Tuple[str, str]:
     return "Lumpy", "SBA"
 
 def compute_everything(df: pd.DataFrame):
+    # --- Column 0 = product, columns 1..end = demand values ---
+    produits = df.iloc[:, 0].astype(str)
     date_cols = list(df.columns[1:])
     parsed_dates = pd.to_datetime(date_cols, errors="coerce")
     n_periods = int(parsed_dates.notna().sum()) or len(date_cols)
@@ -155,52 +147,7 @@ def compute_everything(df: pd.DataFrame):
     methods_df = methods_df[["CV^2", "p", "Catégorie", "Méthode suggérée"]]
     return combined_df, stats_df, counts_df, methods_df
 
-def make_plot(methods_df: pd.DataFrame):
-    fig, ax = plt.subplots(figsize=(8, 6))
-    x = methods_df["p"].clip(lower=0, upper=1)
-    y = methods_df["CV^2"]
-    ax.scatter(x, y)
-    for label, xi, yi in zip(methods_df.index, x, y):
-        if pd.notna(xi) and pd.notna(yi):
-            ax.annotate(f"{label} (p={xi:.3f}, CV²={yi:.3f})", (xi, yi),
-                        textcoords="offset points", xytext=(5, 5))
-    ax.axvline(P_CUTOFF, linestyle="--")
-    ax.axhline(CV2_CUTOFF, linestyle="--")
-    ax.set_xlabel("p (part des périodes non nulles)")
-    ax.set_xlim(0, 1)
-    ax.set_ylabel("CV²")
-    ax.set_title("Classification (p vs CV²) — Syntetos & Boylan")
-    fig.tight_layout()
-    return fig
-
-def excel_bytes(combined_df, stats_df, counts_df, methods_df) -> io.BytesIO:
-    buf = io.BytesIO()
-    for engine in ("openpyxl", "xlsxwriter", None):
-        try:
-            writer = pd.ExcelWriter(buf, engine=engine) if engine else pd.ExcelWriter(buf)
-            with writer:
-                sheet = "Résultats"
-                stats_df.reset_index().to_excel(writer, index=False, sheet_name=sheet, startrow=0, startcol=0)
-                r2 = len(stats_df) + 3
-                counts_df.reset_index().to_excel(writer, index=False, sheet_name=sheet, startrow=r2, startcol=0)
-                r3 = r2 + len(counts_df) + 3
-                combined_df.to_excel(writer, index=False, sheet_name=sheet, startrow=r3, startcol=0)
-                methods_df.reset_index().to_excel(writer, index=False, sheet_name="Méthodes")
-            break
-        except ModuleNotFoundError:
-            buf = io.BytesIO()
-            continue
-    buf.seek(0)
-    return buf
-
 # ======================== Optimisation (n*, Qr*, Qw*) =======================
-def _find_first_col(df: pd.DataFrame, starts_with: str = None, contains: str = None):
-    for c in df.columns:
-        cn = _norm(c)
-        if starts_with and cn.startswith(starts_with): return c
-        if contains and contains in cn: return c
-    return None
-
 def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation depots externe",
                                 time_series_prefix: str = "time seri"):
     info_msgs, warn_msgs = [], []
@@ -214,40 +161,28 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
 
     xls = pd.ExcelFile(io.BytesIO(data_bytes))
 
-    sheet_names_norm = {_norm(s): s for s in xls.sheet_names}
-    conso_sheet = sheet_names_norm.get(_norm(conso_sheet_hint))
-    if not conso_sheet:
-        cands = [s for s in xls.sheet_names if _norm(conso_sheet_hint) in _norm(s)]
-        if cands: conso_sheet = cands[0]
+    # --- Consumption sheet (fixed positions: col0=product, col1=quantity) ---
+    conso_sheet = None
+    for s in xls.sheet_names:
+        if conso_sheet_hint in s.lower():
+            conso_sheet = s
+            break
     if not conso_sheet:
         warn_msgs.append("Feuille 'consommation depots externe' introuvable.")
         return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
 
     df_conso = pd.read_excel(io.BytesIO(data_bytes), sheet_name=conso_sheet)
-
-    code_col = next((c for c in df_conso.columns if "code produit" in _norm(c)), None) or "Code Produit"
-    qty_col = None
-    for c in df_conso.columns:
-        nc = _norm(c)
-        if nc in ("quantite stial", "quantité stial"): qty_col = c; break
-    if qty_col is None:
-        for c in df_conso.columns:
-            nc = _norm(c)
-            if "quantite stial" in nc or "quantité stial" in nc: qty_col = c; break
-    if qty_col is None:
-        for key in ["quantite", "quantité", "qte"]:
-            cand = next((c for c in df_conso.columns if key in _norm(c)), None)
-            if cand: qty_col = cand; break
-
-    if code_col is None or qty_col is None:
-        warn_msgs.append("Colonnes 'Code Produit' et/ou 'Quantite STIAL' introuvables.")
+    if df_conso.shape[1] < 2:
+        warn_msgs.append("Feuille de consommation: besoin de 2 colonnes min.")
         return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
 
-    conso_series = df_conso.groupby(code_col, dropna=False)[qty_col].sum(numeric_only=True)
+    df_conso.iloc[:, 0] = df_conso.iloc[:, 0].astype(str)
+    conso_series = df_conso.groupby(df_conso.columns[0], dropna=False)[df_conso.columns[1]].sum(numeric_only=True)
     info_msgs.append(f"Feuille de consommation : '{conso_sheet}' (lignes : {len(df_conso)})")
-    info_msgs.append(f"Colonne quantité utilisée : '{qty_col}'")
+    info_msgs.append("Colonne quantité utilisée : position 1")
 
-    ts_sheets = [s for s in xls.sheet_names if _norm(s).startswith(_norm(time_series_prefix))]
+    # --- Time series sheets ---
+    ts_sheets = [s for s in xls.sheet_names if s.lower().startswith(time_series_prefix)]
     if not ts_sheets:
         warn_msgs.append("Aucune feuille 'time serie*' trouvée (ex. 'time serie EM0400').")
         return pd.DataFrame(columns=["Code Produit", "n*", "Qr*", "Qw*"]), info_msgs, warn_msgs
@@ -258,18 +193,16 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
             df = pd.read_excel(io.BytesIO(data_bytes), sheet_name=sheet)
             code_produit = sheet.split()[-1]
 
-            cr_col = _find_first_col(df, starts_with="cr")
-            cw_col = _find_first_col(df, starts_with="cw")
-            aw_col = _find_first_col(df, starts_with="aw")
-            ar_col = _find_first_col(df, starts_with="ar")
-            if not all([cr_col, cw_col, aw_col, ar_col]):
-                warn_msgs.append(f"[{sheet}] Paramètres CR/CW/AW/AR manquants — ignoré.")
+            # Parameters are fixed positions: 0=Cr,1=Cw,2=Aw,3=Ar
+            if df.shape[1] < 4:
+                warn_msgs.append(f"[{sheet}] Pas assez de colonnes pour CR/CW/AW/AR.")
                 continue
 
-            C_r = pd.to_numeric(df[cr_col].iloc[0], errors="coerce")
-            C_w = pd.to_numeric(df[cw_col].iloc[0], errors="coerce")
-            A_w = pd.to_numeric(df[aw_col].iloc[0], errors="coerce")
-            A_r = pd.to_numeric(df[ar_col].iloc[0], errors="coerce")
+            C_r = pd.to_numeric(df.iloc[0, 0], errors="coerce")
+            C_w = pd.to_numeric(df.iloc[0, 1], errors="coerce")
+            A_w = pd.to_numeric(df.iloc[0, 2], errors="coerce")
+            A_r = pd.to_numeric(df.iloc[0, 3], errors="coerce")
+
             if any(pd.isna(v) for v in [C_r, C_w, A_w, A_r]) or any(v == 0 for v in [C_w, A_r]):
                 warn_msgs.append(f"[{sheet}] Valeurs de paramètres invalides — ignoré.")
                 continue
@@ -309,36 +242,46 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
     )
     return result_df, info_msgs, warn_msgs
 
+
 # ============================== Forecasting / ROP tools ==============================
 
 def _parse_num_locale(series) -> pd.Series:
+    """Robust numeric parser (handles 1 234,56 / 1.234,56 / 1234.56)."""
     s = pd.Series(series)
     v1 = pd.to_numeric(s, errors="coerce")
     if v1.notna().mean() >= 0.60:
         return v1.fillna(0.0).astype(float)
-    s2 = (s.astype(str).str.replace("\u00A0", "", regex=False).str.replace(" ", "", regex=False))
-    s2b = (s2.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
+    s2 = (s.astype(str)
+            .str.replace("\u00A0", "", regex=False)  # nbsp
+            .str.replace(" ", "", regex=False))      # spaces
+    # remove thousands '.', change decimal ',' → '.'
+    s2b = s2.str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
     v2 = pd.to_numeric(s2b, errors="coerce")
     return v2.fillna(0.0).astype(float)
 
 def _fc_list_time_serie_codes(xls: pd.ExcelFile) -> List[str]:
+    """Find codes from sheets named like: 'time serie EM0400' (tolerant)."""
     codes = []
     for s in xls.sheet_names:
-        sn = _norm(s).replace("-", " ").replace("_", " ")
-        if re.match(r"^(time\s*s[eé]r(?:i|ie|ies)?|timeserie|time\s*series|ts)\b", sn, flags=re.IGNORECASE):
+        sn = re.sub(r"[\-_]", " ", s.lower())
+        if re.match(r"^\s*time\s*s[eé]r(i|ie|ies)?\b", sn):
             m_code = re.search(r"[A-Za-z]{2}\d{3,6}\b", s)
-            if m_code: codes.append(m_code.group(0))
+            if m_code:
+                codes.append(m_code.group(0))
             else:
-                tail_tokens = re.split(r"[:\s]+", s.strip())
-                if tail_tokens: codes.append(tail_tokens[-1])
+                # fallback: last token
+                parts = re.split(r"[:\s]+", s.strip())
+                if parts:
+                    codes.append(parts[-1])
     return sorted(set(codes))
 
 def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
+    """Resolve the sheet for a given code (tolerant patterns)."""
     if code in xls.sheet_names:
         return code
     lc = code.lower().strip()
-    patterns = [
-        rf"^\s*time\s*s[eé]r(?:i|ie|ies)?[\s:_-]*{re.escape(lc)}\s*$",
+    pats = [
+        rf"^\s*time\s*s[eé]r(i|ie|ies)?[\s:_-]*{re.escape(lc)}\s*$",
         rf"^\s*timeserie[\s:_-]*{re.escape(lc)}\s*$",
         rf"^\s*time\s*series[\s:_-]*{re.escape(lc)}\s*$",
         rf"^\s*ts[\s:_-]*{re.escape(lc)}\s*$",
@@ -346,12 +289,16 @@ def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
     ]
     for s in xls.sheet_names:
         sn = s.lower().strip()
-        if any(re.match(p, sn) for p in patterns):
+        if any(re.match(p, sn) for p in pats):
             return s
     raise ValueError(f"Onglet pour '{code}' introuvable.")
 
 def _fc_daily_B_and_C_simple(xls_bytes: bytes, sheet_name: str):
-    # Strict positional reader: A=date, B=stock_on_hand/receipts, C=consommation
+    """
+    Strict positional reader for the time series sheet:
+      Col A (0) = Date,  Col B (1) = Stock / receipts,  Col C (2) = Consommation.
+    Creates full daily index, fills missing days with 0.
+    """
     df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet_name)
     if df.shape[1] < 3:
         raise ValueError(f"Feuille '{sheet_name}' doit avoir au moins 3 colonnes (A,B,C).")
@@ -370,33 +317,42 @@ def _fc_daily_B_and_C_simple(xls_bytes: bytes, sheet_name: str):
         .sort_index()
     )
     if g.empty:
-        raise ValueError(f"Feuille '{sheet_name}': aucune donnée exploitable.")
+        raise ValueError(f"Feuille '{sheet_name}': aucune donnée exploitable (A,B,C).")
+
     full_idx = pd.date_range(g.index.min(), g.index.max(), freq="D")
     stock_daily = g["b"].reindex(full_idx, fill_value=0.0); stock_daily.index.name = "date"
     cons_daily  = g["c"].reindex(full_idx, fill_value=0.0); cons_daily.index.name  = "date"
     return stock_daily, cons_daily
 
+# ---------- Negative Binomial quantile (SciPy or fallback) ----------
 def _nb_quantile_fallback(mean_, var_, service_level, nb_sim, rng):
+    """Gamma–Poisson mixture fallback for NB quantile when SciPy not available."""
     mean_ = float(max(mean_, 0.0))
     var_  = float(max(var_, mean_ + 1e-9))
-    if mean_ == 0.0: return 0.0
+    if mean_ == 0.0:
+        return 0.0
     sl = float(np.clip(service_level, 1e-6, 1 - 1e-6))
     p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
     r = float(mean_**2 / (var_ - mean_)) if var_ > mean_ else 1e6
-    if not np.isfinite(r) or r <= 0: return 0.0
+    if not np.isfinite(r) or r <= 0:
+        return 0.0
     lam = rng.gamma(shape=r, scale=(1.0 - p) / p, size=int(max(1, nb_sim)))
     y = rng.poisson(lam)
     return float(np.percentile(y, 100.0 * sl))
 
 def _nbinom_quantile_scipy(mean_, var_, service_level, nb_sim, rng):
+    """Use SciPy nbinom to get the desired quantile (preferred path)."""
+    from scipy.stats import nbinom as _nb
     mean_ = float(max(mean_, 0.0))
     var_  = float(max(var_, mean_ + 1e-9))
-    if mean_ == 0.0: return 0.0
+    if mean_ == 0.0:
+        return 0.0
     p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
     r = float(mean_**2 / (var_ - mean_)) if var_ > mean_ else 1e6
-    sample = nbinom.rvs(r, p, size=int(max(1, nb_sim)), random_state=rng)
+    sample = _nb.rvs(r, p, size=int(max(1, nb_sim)), random_state=rng)
     return float(np.percentile(sample, 100.0 * float(service_level)))
 
+# ---------- Forecast models ----------
 def _fc_ses_forecast(x, alpha: float):
     x = pd.Series(x).fillna(0.0).astype(float).values
     if len(x) == 0:
@@ -441,7 +397,7 @@ def _fc_forecast_per_method(x, alpha: float, method: str):
     elif m == "sba":
         return _fc_croston_or_sba_forecast(x, alpha, variant="sba")
     else:
-        raise ValueError(f"Méthode inconnue '{method}'. Use 'sba', 'ses', 'croston'.")
+        raise ValueError(f"Méthode inconnue '{method}'. Use 'sba', 'ses', or 'croston'.")
 
 def _fc_interval_sum_next_days(daily: pd.Series, start_idx: int, interval: int) -> float:
     s = start_idx + 1
@@ -462,6 +418,14 @@ def _fc_rolling_with_rops_single_run(
     nb_sim: int,
     rng_seed: int,
 ):
+    """
+    Strict position reading:
+      - Resolve sheet for 'product_code'
+      - A=date, B=stock/receipts, C=consommation
+      - Full daily reindexing
+      - Rolling evaluation by window_ratio and step 'interval'
+      - ROP via NB quantile (SciPy or fallback)
+    """
     sheet = _fc_find_product_sheet(xls, product_code)
     stock_daily, cons_daily = _fc_daily_B_and_C_simple(xls_bytes, sheet)
 
@@ -482,7 +446,7 @@ def _fc_rolling_with_rops_single_run(
             train = vals[:i]
             fc = _fc_forecast_per_method(train, alpha=alpha, method=method)
             f = float(fc["forecast_per_period"])
-            sigma_period = float(pd.Series(train).std(ddof=1)) if i > 1 else 0.0
+            sigma_period = float(pd.Series(train).std(ddof=1))
             if not np.isfinite(sigma_period):
                 sigma_period = 0.0
 
@@ -496,6 +460,7 @@ def _fc_rolling_with_rops_single_run(
 
             forecast_for_interval = f * interval
 
+            # NB parameters for ROPs
             X_Lt = lead_time * f
             sigma_Lt = sigma_period * np.sqrt(max(lead_time, 1e-9))
             var_u = sigma_Lt**2 if sigma_Lt**2 > X_Lt else X_Lt + 1e-5
@@ -515,7 +480,10 @@ def _fc_rolling_with_rops_single_run(
             rop_carry_running += float(ROP_u - real_demand)
 
             rows.append({
-                "method": method, "date": test_date.date(), "code": product_code, "interval": int(interval),
+                "method": method,
+                "date": test_date.date(),
+                "code": product_code,
+                "interval": int(interval),
                 "real_demand": float(real_demand),
                 "stock_on_hand_interval": float(stock_on_hand_interval),
                 "stock_on_hand_running": float(stock_running_cum),
@@ -532,16 +500,21 @@ def _fc_rolling_with_rops_single_run(
                 "reorder_point_fournisseur": float(ROP_f),
                 "stock_status": stock_status,
                 "rop_usine_minus_real_running": float(rop_carry_running),
-                "z_t": float(fc.get("z_t", 0.0)), "p_t": float(fc.get("p_t", 1.0)),
+                "z_t": float(fc.get("z_t", 0.0)),
+                "p_t": float(fc.get("p_t", 1.0)),
             })
 
     return pd.DataFrame(rows)
 
 def _fc_compute_metrics(df_run: pd.DataFrame):
+    """Errors from forecast_for_interval vs real_demand."""
     if df_run.empty or "forecast_error" not in df_run:
         return np.nan, np.nan, np.nan, np.nan
     e = df_run["forecast_error"].astype(float)
-    ME = e.mean(); absME = e.abs().mean(); MSE = (e**2).mean(); RMSE = np.sqrt(MSE)
+    ME = e.mean()
+    absME = e.abs().mean()
+    MSE = (e**2).mean()
+    RMSE = np.sqrt(MSE)
     return ME, absME, MSE, RMSE
 
 def _fc_grid_search_and_final_for_method(
@@ -559,6 +532,11 @@ def _fc_grid_search_and_final_for_method(
     nb_sim: int,
     rng_seed: int,
 ):
+    """
+    Returns:
+      - df_all: all tested combinations w/ ME, absME, MSE, RMSE
+      - df_best: for each code, the best combo for ME/MSE/RMSE
+    """
     all_results, best_rows_per_code = [], []
     for code in product_codes:
         metrics_rows = []
@@ -573,15 +551,17 @@ def _fc_grid_search_and_final_for_method(
                     )
                     ME, absME, MSE, RMSE = _fc_compute_metrics(df_run)
                     metrics_rows.append({
-                        "code": code, "method": method, "alpha": a, "window_ratio": w, "recalc_interval": itv,
-                        "ME": ME, "absME": absME, "MSE": MSE, "RMSE": RMSE, "n_points": len(df_run)
+                        "code": code, "method": method,
+                        "alpha": a, "window_ratio": w, "recalc_interval": itv,
+                        "ME": ME, "absME": absME, "MSE": MSE, "RMSE": RMSE,
+                        "n_points": len(df_run)
                     })
                     all_results.append(metrics_rows[-1])
 
         df_metrics = pd.DataFrame(metrics_rows)
-        best_ME_idx = (df_metrics["absME"]).idxmin() if df_metrics["absME"].notna().any() else None
-        best_MSE_idx = (df_metrics["MSE"]).idxmin()   if df_metrics["MSE"].notna().any()  else None
-        best_RMSE_idx= (df_metrics["RMSE"]).idxmin()  if df_metrics["RMSE"].notna().any() else None
+        best_ME_idx   = df_metrics["absME"].idxmin() if df_metrics["absME"].notna().any() else None
+        best_MSE_idx  = df_metrics["MSE"].idxmin()   if df_metrics["MSE"].notna().any()  else None
+        best_RMSE_idx = df_metrics["RMSE"].idxmin()  if df_metrics["RMSE"].notna().any() else None
 
         best_ME   = df_metrics.loc[best_ME_idx]   if best_ME_idx   is not None else None
         best_MSE  = df_metrics.loc[best_MSE_idx]  if best_MSE_idx  is not None else None
@@ -607,18 +587,32 @@ def _fc_grid_search_and_final_for_method(
     return pd.DataFrame(all_results), pd.DataFrame(best_rows_per_code)
 
 def _fc_pick_params(row: pd.Series, metric: str):
-    if metric == "best_ME":  return row["best_ME_alpha"],  row["best_ME_window"],  int(row["best_ME_interval"])
-    if metric == "best_MSE": return row["best_MSE_alpha"], row["best_MSE_window"], int(row["best_MSE_interval"])
+    if metric == "best_ME":
+        return row["best_ME_alpha"],  row["best_ME_window"],  int(row["best_ME_interval"])
+    if metric == "best_MSE":
+        return row["best_MSE_alpha"], row["best_MSE_window"], int(row["best_MSE_interval"])
     return row["best_RMSE_alpha"], row["best_RMSE_window"], int(row["best_RMSE_interval"])
 
 def _fc_final_run_for_best(
-    xls_bytes: bytes, xls: pd.ExcelFile, method: str, df_best: pd.DataFrame, code: str,
-    pick_metric: str, lead_time: int, lead_time_supplier: int, service_level: float, nb_sim: int, rng_seed: int
+    xls_bytes: bytes,
+    xls: pd.ExcelFile,
+    method: str,
+    df_best: pd.DataFrame,
+    code: str,
+    pick_metric: str,
+    lead_time: int,
+    lead_time_supplier: int,
+    service_level: float,
+    nb_sim: int,
+    rng_seed: int,
 ):
+    """Run detailed table using the best combo for 'code' based on pick_metric."""
     row = df_best[df_best["code"].astype(str) == str(code)]
-    if row.empty: return pd.DataFrame()
+    if row.empty:
+        return pd.DataFrame()
     a, w, itv = _fc_pick_params(row.iloc[0], pick_metric)
-    if pd.isna(a) or pd.isna(w) or pd.isna(itv): return pd.DataFrame()
+    if pd.isna(a) or pd.isna(w) or pd.isna(itv):
+        return pd.DataFrame()
     return _fc_rolling_with_rops_single_run(
         xls_bytes=xls_bytes, xls=xls, product_code=code, method=method,
         alpha=float(a), window_ratio=float(w), interval=int(itv),
@@ -627,6 +621,7 @@ def _fc_final_run_for_best(
     )
 
 def _display_table_with_order(df_run: pd.DataFrame):
+    """Add 'order' convenience column for the UI and reorder columns."""
     if df_run.empty:
         return pd.DataFrame()
     tbl = df_run.copy()
@@ -646,6 +641,7 @@ def _display_table_with_order(df_run: pd.DataFrame):
     return tbl[cols]
 
 def summarize_hold_vs_rupture(df_run: pd.DataFrame):
+    """Quick summary, used if you need KPI blocks."""
     if df_run.empty:
         return 0.0, 0.0, 0.0
     diff = (df_run["reorder_point_usine"].fillna(0) - df_run["real_demand"]).astype(float)
@@ -654,7 +650,9 @@ def summarize_hold_vs_rupture(df_run: pd.DataFrame):
     share = (diff >= 0).mean()
     return float(holding), float(rupture), float(share)
 
+
 # ============================== UI — Uploaders ==============================
+
 if "uploader_nonce" not in st.session_state:
     st.session_state["uploader_nonce"] = 0
 nonce = st.session_state["uploader_nonce"]
@@ -813,7 +811,7 @@ else:
         codes = _fc_list_time_serie_codes(xls)
         if not codes:
             st.warning("Aucune feuille 'time serie *' détectée.")
-            codes = xls.sheet_names  # allow manual selection
+            codes = xls.sheet_names  # fallback
 
         if codes:
             c_left, c_right = st.columns([2,1])
@@ -832,9 +830,9 @@ else:
                 rng_seed = st.number_input("RNG seed", min_value=0, value=42, step=1)
 
             if not _SCIPY_OK:
-                st.warning("SciPy non disponible — ROP via **fallback Gamma–Poisson** (légères différences).")
+                st.warning("SciPy non disponible — ROP via **fallback Gamma–Poisson**.")
 
-            # ---------- Caching wrapper ----------
+            # ---------- caching wrapper ----------
             @st.cache_data(show_spinner=False)
             def cache_grid(xls_bytes: bytes, codes: List[str], method: str, pick_metric: str,
                            alphas: List[float], window_ratios: List[float], intervals: List[int],
@@ -866,7 +864,6 @@ else:
                                     lead_time, lead_time_supplier, base_service_level,
                                     nb_sim, rng_seed
                                 )
-                            # store for comparison later
                             st.session_state[f"best_{m}"] = df_best.copy()
 
                             c1, c2 = st.columns([2,1], vertical_alignment="top")
@@ -888,7 +885,6 @@ else:
                                 file_name=f"grid_search_{m}.csv", mime="text/csv",
                             )
 
-                            # ---- Detailed table for one product (with 'order' column) ----
                             st.markdown("### Table détaillée (meilleurs paramètres) avec **order**")
                             if not df_best.empty:
                                 code_for_table = st.selectbox(
@@ -906,15 +902,16 @@ else:
                                     tbl = _display_table_with_order(df_final_table)
                                     if tbl.empty or (tbl[["real_demand","stock_on_hand_interval","forecast_for_interval"]]
                                                      .sum().sum() == 0):
-                                        st.warning("Données nulles dans la fenêtre d’évaluation pour ce produit. "
-                                                   "Vérifiez la colonne C (consommation) et le format des nombres, "
-                                                   "ou réduisez le window ratio.")
+                                        st.warning("Données nulles pour ce produit (col A/B/C manquantes ou mal formatées).")
                                     st.dataframe(tbl, use_container_width=True)
                                     st.download_button(
                                         "Télécharger la table (CSV)",
                                         data=tbl.to_csv(index=False).encode("utf-8"),
                                         file_name=f"details_{m}_{code_for_table}.csv", mime="text/csv"
                                     )
+
+
+
             # ====================== Comparison (cached, on-demand) ======================
             st.markdown("---")
             st.header("📊 Comparaison: Mean Holding & CT (par méthode et niveau de service)")
@@ -967,7 +964,7 @@ else:
                         ("croston", df_best_croston),
                         ("ses", df_best_ses),
                     ]:
-                        if df_best is None or df_best.empty:  # skip if not computed
+                        if df_best is None or df_best.empty:
                             continue
 
                         for _, r in df_best.iterrows():
