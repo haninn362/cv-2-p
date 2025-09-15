@@ -1,6 +1,10 @@
+# app.py
 # ============================================================
-# Full Streamlit App: Classification + Optimisation + Forecasting (SBA, Croston, SES) + Comparison
-# Option 1 fix: read sheets with header=0 but ALWAYS use column positions (0=date, 1=stock, 2=consumption)
+# Full Streamlit App:
+# - Classification (p & CV²) + Optimisation (n*, Qr*, Qw*)
+# - Forecasting & ROP: SBA / Croston / SES (separate blocks)
+# - Comparison Tables (Mean Holding & CT)
+# - Single import block; positional column reading (A,B,C)
 # ============================================================
 
 import io
@@ -24,7 +28,7 @@ ADI_CUTOFF = 1.32
 P_CUTOFF = 1.0 / ADI_CUTOFF       # ≈ 0.757576
 CV2_CUTOFF = 0.49
 
-st.set_page_config(page_title="Classification & Forecasting — p & CV² + SBA/Croston/SES", layout="wide")
+st.set_page_config(page_title="Classification & Optimisation & ROP", layout="wide")
 
 # ======================== Styles (fixed bar) ========================
 st.markdown(
@@ -61,6 +65,38 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# ============================ Utilities ============================
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s).strip().lower())
+
+def _get_excel_bytes(file_like) -> bytes:
+    if file_like is None:
+        return b""
+    if hasattr(file_like, "getvalue"):
+        try:
+            return file_like.getvalue()
+        except Exception:
+            pass
+    try:
+        data = file_like.read()
+        return data
+    finally:
+        try:
+            file_like.seek(0)
+        except Exception:
+            pass
+
+def _parse_num_locale(series) -> pd.Series:
+    """Parse numbers robustly: '1 234,56', '1,234.56', '1234' → float"""
+    s = pd.Series(series)
+    v1 = pd.to_numeric(s, errors="coerce")
+    if v1.notna().mean() >= 0.60:
+        return v1.fillna(0.0).astype(float)
+    s2 = (s.astype(str).str.replace("\u00A0", "", regex=False).str.replace(" ", "", regex=False))
+    s2b = (s2.str.replace(".", "", regex=False).str.replace(",", ".", regex=False))
+    v2 = pd.to_numeric(s2b, errors="coerce")
+    return v2.fillna(0.0).astype(float)
 
 # ============================ Classification logic ============================
 def choose_method(p: float, cv2: float) -> Tuple[str, str]:
@@ -174,21 +210,6 @@ def excel_bytes(combined_df, stats_df, counts_df, methods_df) -> io.BytesIO:
     buf.seek(0)
     return buf
 
-# ======================== Helpers / Excel I/O =======================
-def _norm(s: str) -> str: return re.sub(r"\s+", " ", str(s).strip().lower())
-
-def _get_excel_bytes(file_like) -> bytes:
-    if file_like is None: return b""
-    if hasattr(file_like, "getvalue"):
-        try: return file_like.getvalue()
-        except Exception: pass
-    try:
-        data = file_like.read()
-        return data
-    finally:
-        try: file_like.seek(0)
-        except Exception: pass
-
 # ======================== Optimisation (n*, Qr*, Qw*) =======================
 def _find_first_col(df: pd.DataFrame, starts_with: str = None, contains: str = None):
     for c in df.columns:
@@ -251,7 +272,7 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
     rows = []
     for sheet in ts_sheets:
         try:
-            df = pd.read_excel(io.BytesIO(data_bytes), sheet_name=sheet, header=0)  # keep headers for human reading
+            df = pd.read_excel(io.BytesIO(data_bytes), sheet_name=sheet)
             code_produit = sheet.split()[-1]
 
             cr_col = _find_first_col(df, starts_with="cr")
@@ -305,7 +326,7 @@ def compute_qr_qw_from_workbook(file_like, conso_sheet_hint: str = "consommation
     )
     return result_df, info_msgs, warn_msgs
 
-# ============================== UI — Header ==============================
+# ============================== UI (Top) ==============================
 if "uploader_nonce" not in st.session_state:
     st.session_state["uploader_nonce"] = 0
 nonce = st.session_state["uploader_nonce"]
@@ -325,7 +346,7 @@ st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown('<div class="control">', unsafe_allow_html=True)
 uploaded_opt = st.file_uploader(
-    "Classeur **optimisation** (optionnel)",
+    "Classeur **optimisation / time series** (optionnel)",
     type=["xlsx", "xls"],
     key=f"opt_{nonce}",
     help="Inclut 'consommation depots externe' + feuilles 'time serie *'."
@@ -446,443 +467,834 @@ if uploaded is not None and sheet_name is not None:
 else:
     st.info("Téléversez d’abord le classeur de classification. (Vous pouvez aussi téléverser un classeur d’optimisation séparé.)")
 
-# ====================== Section: Forecasting & ROP ======================
+# ====================== Section: Prévisions & ROP ======================
 st.markdown("---")
-st.header("📈 Prévisions & ROP — SBA / SES / Croston (position-based columns)")
+st.header("📈 Prévisions & ROP — SBA / SES / Croston (colonnes par position A/B/C)")
 
-# ---------- Shared helpers for Forecast ----------
-def _load_series_by_position(file_like, sheet_name: str):
-    """Read a sheet keeping header row but FORCE column positions: 0=date, 1=stock, 2=consumption."""
-    data = _get_excel_bytes(file_like) if not isinstance(file_like, (str, bytes)) else file_like
-    df = pd.read_excel(io.BytesIO(data) if isinstance(data, (bytes, bytearray)) else file_like,
-                       sheet_name=sheet_name, header=0)
-    dates = pd.to_datetime(df.iloc[:, 0], errors="coerce")
-    stock = pd.to_numeric(df.iloc[:, 1], errors="coerce").fillna(0.0).astype(float)
-    cons  = pd.to_numeric(df.iloc[:, 2], errors="coerce").fillna(0.0).astype(float)
-
-    ts_cons  = (pd.DataFrame({"d": dates, "q": cons})
-                .dropna(subset=["d"]).sort_values("d").set_index("d")["q"])
-    ts_stock = (pd.DataFrame({"d": dates, "s": stock})
-                .dropna(subset=["d"]).sort_values("d").set_index("d")["s"])
-
-    if ts_cons.empty or ts_stock.empty:
-        raise ValueError(f"Feuille '{sheet_name}': données insuffisantes. Vérifiez que les 3 premières colonnes "
-                         f"sont bien (Date, Stock, Consommation).")
-
-    min_date = min(ts_cons.index.min(), ts_stock.index.min())
-    max_date = max(ts_cons.index.max(), ts_stock.index.max())
-    full_idx = pd.date_range(min_date, max_date, freq="D")
-
-    cons_daily  = ts_cons.reindex(full_idx, fill_value=0.0)
-    stock_daily = ts_stock.reindex(full_idx).ffill().fillna(0.0)
-    return cons_daily, stock_daily
-
-def _interval_sum_next_days(daily: pd.Series, start_idx: int, interval: int) -> float:
-    s = start_idx + 1
-    e = s + int(max(0, interval))
-    return float(pd.Series(daily).iloc[s:e].sum())
-
-def _croston_or_sba_forecast_array(x, alpha: float, variant: str = "sba"):
-    x = pd.Series(x).fillna(0.0).astype(float).values
-    x = np.where(x < 0, 0.0, x)
-    if (x == 0).all():
-        return {"forecast_per_period": 0.0, "z_t": 0.0, "p_t": float("inf")}
-    nz_idx = [i for i, v in enumerate(x) if v > 0]
-    first = nz_idx[0]
-    z = x[first]
-    if len(nz_idx) >= 2:
-        p = sum([j - i for i, j in zip(nz_idx[:-1], nz_idx[1:])]) / len(nz_idx)
-    else:
-        p = len(x) / len(nz_idx)
-    psd = 0
-    for t in range(first + 1, len(x)):
-        psd += 1
-        if x[t] > 0:
-            I_t = psd
-            z = alpha * x[t] + (1 - alpha) * z
-            p = alpha * I_t + (1 - alpha) * p
-            psd = 0
-    f = z / p
-    if variant.lower() == "sba":
-        f *= (1 - alpha / 2.0)
-    return {"forecast_per_period": float(f), "z_t": float(z), "p_t": float(p)}
-
-def _croston_forecast_array(x, alpha: float):
-    return _croston_or_sba_forecast_array(x, alpha, variant="croston")
-
-def _ses_forecast_array(x, alpha: float):
-    x = pd.Series(x).fillna(0.0).astype(float).values
-    if len(x) == 0:
-        return {"forecast_per_period": 0.0}
-    l = x[0]
-    for t in range(1, len(x)):
-        l = alpha * x[t] + (1 - alpha) * l
-    return {"forecast_per_period": float(l)}
-
-def _nbinom_quantile(mean_, var_, service_level, nb_sim, rng):
-    """SciPy if available; else fallback Gamma-Poisson."""
-    mean_ = float(max(mean_, 0.0))
-    var_  = float(max(var_, mean_ + 1e-9))  # overdispersion
-    if mean_ == 0.0: return 0.0
-    if _SCIPY_OK:
-        p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
-        r = float(mean_**2 / (var_ - mean_)) if var_ > mean_ else 1e6
-        sample = nbinom.rvs(r, p, size=int(max(1, nb_sim)), random_state=rng)
-        return float(np.percentile(sample, 100.0 * float(service_level)))
-    else:
-        # Fallback Gamma-Poisson
-        p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
-        r = float(mean_**2 / (var_ - mean_)) if var_ > mean_ else 1e6
-        lam = rng.gamma(shape=r, scale=(1.0 - p) / p, size=int(max(1, nb_sim)))
-        y = rng.poisson(lam)
-        return float(np.percentile(y, 100.0 * float(service_level)))
-
-def _rolling_with_rops_single_run(
-    file_like,
-    product_code: str,
-    method: str,             # 'sba' | 'croston' | 'ses'
-    alpha: float,
-    window_ratio: float,
-    interval: int,
-    lead_time: int,
-    lead_time_supplier: int,
-    service_level: float,
-    nb_sim: int,
-    rng_seed: int,
-):
-    sheet = f"time serie {product_code}"
-    cons_daily, stock_daily = _load_series_by_position(file_like, sheet)
-
-    vals = cons_daily.values
-    split_index = int(len(vals) * window_ratio)
-    if split_index < 2:
-        return pd.DataFrame()
-
-    rng = np.random.default_rng(rng_seed)
-    rows = []
-    rop_carry_running = 0.0
-    stock_after_interval = 0.0
-
-    for i in range(split_index, len(vals)):
-        if (i - split_index) % interval == 0:
-            train = vals[:i]
-            test_date = cons_daily.index[i]
-
-            if method == "ses":
-                fc = _ses_forecast_array(train, alpha=alpha)
-            elif method == "croston":
-                fc = _croston_forecast_array(train, alpha=alpha)
-            else:
-                fc = _croston_or_sba_forecast_array(train, alpha=alpha, variant="sba")
-
-            f = float(fc["forecast_per_period"])
-            sigma_period = float(pd.Series(train).std(ddof=1)) if i > 1 else 0.0
-            if not np.isfinite(sigma_period): sigma_period = 0.0
-
-            real_demand = _interval_sum_next_days(cons_daily, i, interval)              # demand in next interval
-            stock_on_hand_interval = _interval_sum_next_days(stock_daily, i, interval)  # stock flow proxy
-            stock_after_interval = stock_after_interval + stock_on_hand_interval - real_demand
-
-            # mean/var over lead times
-            X_Lt = lead_time * f
-            sigma_Lt = sigma_period * np.sqrt(max(lead_time, 1e-9))
-            var_u = sigma_Lt**2 if sigma_Lt**2 > X_Lt else X_Lt + 1e-5
-
-            totalL = lead_time + lead_time_supplier
-            X_Lt_Lw = totalL * f
-            sigma_Lt_Lw = sigma_period * np.sqrt(max(totalL, 1e-9))
-            var_f = sigma_Lt_Lw**2 if sigma_Lt_Lw**2 > X_Lt_Lw else X_Lt_Lw + 1e-5
-
-            # ROPs
-            ROP_u = _nbinom_quantile(X_Lt,    var_u, service_level, nb_sim, rng)
-            ROP_f = _nbinom_quantile(X_Lt_Lw, var_f, service_level, nb_sim, rng)
-
-            rop_carry_running += float(ROP_u - real_demand)
-            stock_status = "holding" if stock_after_interval > 0 else "rupture"
-
-            rows.append({
-                "method": method, "date": test_date.date(), "code": product_code, "interval": int(interval),
-                "real_demand": float(real_demand),
-                "stock_on_hand_running": float(stock_on_hand_interval),
-                "stock_after_interval": float(stock_after_interval),
-                "can_cover_interval": "yes" if stock_after_interval >= 0 else "no",
-                "order_policy": "half_of_interval_demand" if stock_after_interval >= 0 else "shortfall_to_cover",
-                "reorder_point_usine": float(ROP_u),
-                "lead_time_usine_days": int(lead_time),
-                "lead_time_supplier_days": int(lead_time_supplier),
-                "reorder_point_fournisseur": float(ROP_f),
-                "stock_status": stock_status,
-                "rop_usine_minus_real_running": float(rop_carry_running),
-            })
-
-    return pd.DataFrame(rows)
-
-def _compute_metrics(df_run: pd.DataFrame):
-    if df_run.empty or "real_demand" not in df_run or "reorder_point_usine" not in df_run:
-        return np.nan, np.nan, np.nan, np.nan
-    est = df_run["reorder_point_usine"] / df_run["lead_time_usine_days"].replace(0, np.nan)
-    e = df_run["real_demand"] - est
-    ME = e.mean()
-    absME = e.abs().mean()
-    MSE = (e**2).mean()
-    RMSE = float(np.sqrt(MSE)) if np.isfinite(MSE) else np.nan
-    return ME, absME, MSE, RMSE
-
-def _grid_search_and_best(
-    file_like,
-    product_codes: List[str],
-    method: str,
-    alphas: List[float],
-    window_ratios: List[float],
-    intervals: List[int],
-    lead_time: int,
-    lead_time_supplier: int,
-    service_level: float,
-    nb_sim: int,
-    rng_seed: int,
-):
-    all_records, best_rows = [], []
-    for code in product_codes:
-        best_row = None
-        best_rmse = np.inf
-        for a in alphas:
-            for w in window_ratios:
-                for itv in intervals:
-                    df_run = _rolling_with_rops_single_run(
-                        file_like=file_like, product_code=code, method=method, alpha=a, window_ratio=w, interval=itv,
-                        lead_time=lead_time, lead_time_supplier=lead_time_supplier,
-                        service_level=service_level, nb_sim=nb_sim, rng_seed=rng_seed
-                    )
-                    _, _, _, RMSE = _compute_metrics(df_run)
-                    rec = {"code": code, "method": method, "alpha": a, "window_ratio": w, "recalc_interval": itv,
-                           "ME": np.nan, "absME": np.nan, "MSE": np.nan, "RMSE": RMSE, "n_points": len(df_run)}
-                    all_records.append(rec)
-                    if pd.notna(RMSE):
-                        if (RMSE < best_rmse * 0.99) or (np.isclose(RMSE, best_rmse, rtol=0.01) and best_row is not None and
-                                                         (itv, a, w) > (best_row["recalc_interval"], best_row["alpha"], best_row["window_ratio"])):
-                            best_rmse = RMSE
-                            best_row = {"code": code, "alpha": a, "window_ratio": w, "recalc_interval": itv, "RMSE": RMSE}
-        if best_row:
-            best_rows.append(best_row)
-    return pd.DataFrame(all_records), pd.DataFrame(best_rows)
-
-def _list_time_serie_codes(xls: pd.ExcelFile) -> List[str]:
-    codes = []
-    for s in xls.sheet_names:
-        sn = _norm(s)
-        if sn.startswith("time seri"):
-            tail = s.split()[-1]
-            codes.append(str(tail))
-    return sorted(set(codes))
-
-# ---------- UI for Forecast ----------
 _fc_src = uploaded_opt or uploaded
 if _fc_src is None:
     st.info("Téléversez un classeur contenant des feuilles **time serie <CODE>**.")
 else:
+    xls_bytes = _get_excel_bytes(_fc_src)
     try:
-        xls_bytes = _get_excel_bytes(_fc_src)
-        xls = pd.ExcelFile(io.BytesIO(xls_bytes))
+        XLF = pd.ExcelFile(io.BytesIO(xls_bytes))
     except Exception as e:
         st.error(f"Impossible de lire le classeur de prévisions : {e}")
-        xls = None
+        XLF = None
 
-    if xls is not None:
-        codes = _list_time_serie_codes(xls)
+    # ---------- Helpers for time-series sheets ----------
+    def _ts_list_codes(xls: pd.ExcelFile) -> List[str]:
+        codes = []
+        for s in xls.sheet_names:
+            sn = _norm(s).replace("-", " ").replace("_", " ")
+            if re.match(r"^(time\s*s[eé]r(?:i|ie|ies)?|timeserie|time\s*series|ts)\b", sn, flags=re.IGNORECASE):
+                m_code = re.search(r"[A-Za-z]{2}\d{3,6}\b", s)
+                if m_code: codes.append(m_code.group(0))
+                else:
+                    tail_tokens = re.split(r"[:\s]+", s.strip())
+                    if tail_tokens: codes.append(tail_tokens[-1])
+        # If none matched, allow selecting any sheet
+        if not codes:
+            return xls.sheet_names
+        return sorted(set(codes))
+
+    def _ts_find_sheet_for_code(xls: pd.ExcelFile, code: str) -> str:
+        if code in xls.sheet_names:
+            return code
+        lc = code.lower().strip()
+        patterns = [
+            rf"^\s*time\s*s[eé]r(?:i|ie|ies)?[\s:_-]*{re.escape(lc)}\s*$",
+            rf"^\s*timeserie[\s:_-]*{re.escape(lc)}\s*$",
+            rf"^\s*time\s*series[\s:_-]*{re.escape(lc)}\s*$",
+            rf"^\s*ts[\s:_-]*{re.escape(lc)}\s*$",
+            rf".*\b{re.escape(lc)}\b.*",
+        ]
+        for s in xls.sheet_names:
+            sn = s.lower().strip()
+            if any(re.match(p, sn) for p in patterns):
+                return s
+        raise ValueError(f"Onglet pour '{code}' introuvable.")
+
+    # ---------- Positional readers (A,B,C) ----------
+    def _daily_B_and_C_positional(xls_bytes: bytes, sheet_name: str):
+        """
+        Column A: date, Column B: stock_on_hand / receipts, Column C: consumption
+        Use header row present (header=0), but pick by **position**.
+        """
+        df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet_name, header=0)
+        if df.shape[1] < 3:
+            raise ValueError(f"Feuille '{sheet_name}' doit avoir au moins 3 colonnes (A,B,C).")
+        date_col  = df.columns[0]
+        stock_col = df.columns[1]
+        cons_col  = df.columns[2]
+
+        dates = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
+        stock = _parse_num_locale(df[stock_col])
+        cons  = _parse_num_locale(df[cons_col])
+
+        g = (
+            pd.DataFrame({"date": dates, "b": stock, "c": cons})
+            .dropna(subset=["date"])
+            .groupby("date", as_index=True)[["b", "c"]].sum()
+            .sort_index()
+        )
+        if g.empty:
+            raise ValueError(f"Feuille '{sheet_name}': aucune donnée exploitable.")
+        full_idx = pd.date_range(g.index.min(), g.index.max(), freq="D")
+        stock_daily = g["b"].reindex(full_idx).ffill().fillna(0.0); stock_daily.index.name = "date"
+        cons_daily  = g["c"].reindex(full_idx, fill_value=0.0);    cons_daily.index.name  = "date"
+        return stock_daily, cons_daily
+
+    def _interval_sum_next_days(daily: pd.Series, start_idx: int, interval: int) -> float:
+        s = start_idx + 1
+        e = s + int(max(0, interval))
+        return float(pd.Series(daily).iloc[s:e].sum())
+
+    # ---------- NB quantiles (SciPy primary; Gamma–Poisson fallback) ----------
+    def _nb_quantile_fallback(mean_, var_, service_level, nb_sim, rng):
+        mean_ = float(max(mean_, 0.0))
+        var_  = float(max(var_, mean_ + 1e-9))            # enforce overdispersion
+        if mean_ == 0.0: return 0.0
+        sl = float(np.clip(service_level, 1e-6, 1 - 1e-6))
+        p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
+        r = float(mean_**2 / (var_ - mean_)) if var_ > mean_ else 1e6
+        if not np.isfinite(r) or r <= 0: return 0.0
+        lam = rng.gamma(shape=r, scale=(1.0 - p) / p, size=int(max(1, nb_sim)))
+        y = rng.poisson(lam)
+        return float(np.percentile(y, 100.0 * sl))
+
+    def _nbinom_quantile_scipy(mean_, var_, service_level, nb_sim, rng):
+        mean_ = float(max(mean_, 0.0))
+        var_  = float(max(var_, mean_ + 1e-9))
+        if mean_ == 0.0: return 0.0
+        p = float(np.clip(mean_ / var_, 1e-12, 1 - 1e-12))
+        r = float(mean_**2 / (var_ - mean_)) if var_ > mean_ else 1e6
+        sample = nbinom.rvs(r, p, size=int(max(1, nb_sim)), random_state=rng)
+        return float(np.percentile(sample, 100.0 * float(service_level)))
+
+    # ============================================================
+    # =========================  SBA  =============================
+    # ============================================================
+    def _find_product_sheet_sba(xls: pd.ExcelFile, code: str) -> str:
+        return _ts_find_sheet_for_code(xls, code)
+
+    def _daily_consumption_and_stock_sba(xls_bytes: bytes, sheet_name: str):
+        return _daily_B_and_C_positional(xls_bytes, sheet_name)
+
+    def _croston_or_sba_forecast_array_sba(x, alpha: float, variant: str = "sba"):
+        x = pd.Series(x).fillna(0.0).astype(float).values
+        x = np.where(x < 0, 0.0, x)
+        if (x == 0).all():
+            return {"forecast_per_period": 0.0, "z_t": 0.0, "p_t": float("inf")}
+        nz_idx = [i for i, v in enumerate(x) if v > 0]
+        first = nz_idx[0]
+        z = x[first]
+        if len(nz_idx) >= 2:
+            p = sum([j - i for i, j in zip(nz_idx[:-1], nz_idx[1:])]) / len(nz_idx)
+        else:
+            p = len(x) / len(nz_idx)
+        psd = 0
+        for t in range(first + 1, len(x)):
+            psd += 1
+            if x[t] > 0:
+                I_t = psd
+                z = alpha * x[t] + (1 - alpha) * z
+                p = alpha * I_t + (1 - alpha) * p
+                psd = 0
+        f = z / p
+        if variant.lower() == "sba":
+            f *= (1 - alpha / 2.0)
+        return {"forecast_per_period": float(f), "z_t": float(z), "p_t": float(p)}
+
+    def rolling_sba_with_rops_single_run(
+        xls_bytes: bytes,
+        xls: pd.ExcelFile,
+        product_code: str,
+        alpha: float,
+        window_ratio: float,
+        interval: int,
+        lead_time: int,
+        lead_time_supplier: int,
+        service_level: float,
+        nb_sim: int,
+        rng_seed: int,
+        variant: str = "sba",
+    ):
+        sheet = _find_product_sheet_sba(xls, product_code)
+        stock_daily, cons_daily = _daily_consumption_and_stock_sba(xls_bytes, sheet)
+        vals = cons_daily.values
+        split_index = int(len(vals) * window_ratio)
+        if split_index < 2:
+            return pd.DataFrame()
+
+        rng = np.random.default_rng(rng_seed)
+        rows = []
+        rop_carry_running = 0.0
+        stock_after_interval = 0.0
+
+        for i in range(split_index, len(vals)):
+            if (i - split_index) % interval == 0:
+                train = vals[:i]
+                test_date = cons_daily.index[i]
+
+                fc = _croston_or_sba_forecast_array_sba(train, alpha=alpha, variant=variant)
+                f = float(fc["forecast_per_period"])
+                sigma_period = float(pd.Series(train).std(ddof=1)) if i > 1 else 0.0
+                if not np.isfinite(sigma_period):
+                    sigma_period = 0.0
+
+                real_demand = _interval_sum_next_days(cons_daily, i, interval)              # Col C
+                stock_on_hand_running = _interval_sum_next_days(stock_daily, i, interval)   # Col B
+                stock_after_interval = stock_after_interval + stock_on_hand_running - real_demand
+
+                next_real_demand = _interval_sum_next_days(cons_daily, i + interval, interval) if (i + interval) < len(vals) else 0.0
+                can_cover_interval = "yes" if stock_after_interval >= next_real_demand else "no"
+                order_policy = "half_of_interval_demand" if can_cover_interval == "yes" else "shortfall_to_cover"
+
+                X_Lt = lead_time * f
+                sigma_Lt = sigma_period * np.sqrt(max(lead_time, 1e-9))
+                var_u = sigma_Lt**2 if sigma_Lt**2 > X_Lt else X_Lt + 1e-5
+
+                if _SCIPY_OK:
+                    ROP_u = _nbinom_quantile_scipy(X_Lt, var_u, service_level, nb_sim, rng)
+                else:
+                    ROP_u = _nb_quantile_fallback(X_Lt, var_u, service_level, nb_sim, rng)
+
+                totalL = lead_time + lead_time_supplier
+                X_Lt_Lw = totalL * f
+                sigma_Lt_Lw = sigma_period * np.sqrt(max(totalL, 1e-9))
+                var_f = sigma_Lt_Lw**2 if sigma_Lt_Lw**2 > X_Lt_Lw else X_Lt_Lw + 1e-5
+
+                if _SCIPY_OK:
+                    ROP_f = _nbinom_quantile_scipy(X_Lt_Lw, var_f, service_level, nb_sim, rng)
+                else:
+                    ROP_f = _nb_quantile_fallback(X_Lt_Lw, var_f, service_level, nb_sim, rng)
+
+                rop_carry_running += float(ROP_u - real_demand)
+                stock_status = "holding" if stock_after_interval > 0 else "rupture"
+
+                rows.append({
+                    "date": test_date.date(),
+                    "code": product_code,
+                    "interval": int(interval),
+                    "real_demand": float(real_demand),
+                    "stock_on_hand_running": float(stock_on_hand_running),
+                    "stock_after_interval": float(stock_after_interval),
+                    "can_cover_interval": can_cover_interval,
+                    "order_policy": order_policy,
+                    "reorder_point_usine": float(ROP_u),
+                    "lead_time_usine_days": int(lead_time),
+                    "lead_time_supplier_days": int(lead_time_supplier),
+                    "reorder_point_fournisseur": float(ROP_f),
+                    "stock_status": stock_status,
+                    "rop_usine_minus_real_running": float(rop_carry_running),
+                })
+
+        return pd.DataFrame(rows)
+
+    def compute_metrics_sba(df_run: pd.DataFrame):
+        if df_run.empty or "real_demand" not in df_run or "reorder_point_usine" not in df_run:
+            return np.nan, np.nan, np.nan, np.nan
+        est = df_run["reorder_point_usine"] / df_run["lead_time_usine_days"].replace(0, np.nan)
+        e = df_run["real_demand"] - est
+        ME = e.mean()
+        absME = e.abs().mean()
+        MSE = (e**2).mean()
+        RMSE = float(np.sqrt(MSE)) if np.isfinite(MSE) else np.nan
+        return ME, absME, MSE, RMSE
+
+    def _grid_and_final_sba(
+        product_codes: List[str],
+        alphas: List[float],
+        window_ratios: List[float],
+        recalc_intervals: List[int],
+        lead_time: int,
+        lead_time_supplier: int,
+        base_service_level: float,
+        nb_sim: int,
+        rng_seed: int,
+    ):
+        best_rows = []
+        for code in product_codes:
+            best_row = None
+            best_rmse = np.inf
+            for a in alphas:
+                for w in window_ratios:
+                    for itv in recalc_intervals:
+                        df_run = rolling_sba_with_rops_single_run(
+                            xls_bytes=xls_bytes, xls=XLF, product_code=code,
+                            alpha=a, window_ratio=w, interval=itv,
+                            lead_time=lead_time, lead_time_supplier=lead_time_supplier,
+                            service_level=base_service_level, nb_sim=nb_sim, rng_seed=rng_seed,
+                            variant="sba",
+                        )
+                        _, _, _, RMSE = compute_metrics_sba(df_run)
+                        if pd.notna(RMSE):
+                            if (RMSE < best_rmse * 0.99) or (np.isclose(RMSE, best_rmse, rtol=0.01) and best_row is not None and (
+                                (itv, a, w) > (best_row["recalc_interval"], best_row["alpha"], best_row["window_ratio"])
+                            )):
+                                best_rmse = RMSE
+                                best_row = {"code": code, "alpha": a, "window_ratio": w, "recalc_interval": itv, "RMSE": RMSE}
+            if best_row:
+                best_rows.append(best_row)
+
+        df_best_sba = pd.DataFrame(best_rows)
+
+        st.subheader("SBA — Best parameters (by RMSE)")
+        st.dataframe(df_best_sba, use_container_width=True, hide_index=True)
+
+        st.markdown("**SBA Final Tables (best params)**")
+        for _, r in df_best_sba.iterrows():
+            code = r["code"]; a = r["alpha"]; w = r["window_ratio"]; itv = r["recalc_interval"]
+            st.caption(f"SBA {code}: alpha={a}, window={w}, interval={itv}")
+            df_final = rolling_sba_with_rops_single_run(
+                xls_bytes=xls_bytes, xls=XLF, product_code=code,
+                alpha=float(a), window_ratio=float(w), interval=int(itv),
+                lead_time=lead_time, lead_time_supplier=lead_time_supplier,
+                service_level=base_service_level, nb_sim=nb_sim, rng_seed=rng_seed,
+                variant="sba"
+            )
+            if not df_final.empty:
+                st.dataframe(df_final, use_container_width=True)
+        return df_best_sba
+
+    # ============================================================
+    # =======================  CROSTON  ===========================
+    # ============================================================
+    def _find_product_sheet_croston(xls: pd.ExcelFile, code: str) -> str:
+        return _ts_find_sheet_for_code(xls, code)
+
+    def _daily_consumption_and_stock_croston(xls_bytes: bytes, sheet_name: str):
+        return _daily_B_and_C_positional(xls_bytes, sheet_name)
+
+    def _croston_forecast_array_croston(x, alpha: float):
+        x = pd.Series(x).fillna(0.0).astype(float).values
+        x = np.where(x < 0, 0.0, x)
+        if (x == 0).all():
+            return {"forecast_per_period": 0.0, "z_t": 0.0, "p_t": float("inf")}
+        nz_idx = [i for i, v in enumerate(x) if v > 0]
+        first = nz_idx[0]
+        z = x[first]
+        if len(nz_idx) >= 2:
+            p = sum([j - i for i, j in zip(nz_idx[:-1], nz_idx[1:])]) / len(nz_idx)
+        else:
+            p = len(x) / len(nz_idx)
+        psd = 0
+        for t in range(first + 1, len(x)):
+            psd += 1
+            if x[t] > 0:
+                I_t = psd
+                z = alpha * x[t] + (1 - alpha) * z
+                p = alpha * I_t + (1 - alpha) * p
+                psd = 0
+        f = z / p
+        return {"forecast_per_period": float(f), "z_t": float(z), "p_t": float(p)}
+
+    def rolling_croston_with_rops_single_run(
+        xls_bytes: bytes,
+        xls: pd.ExcelFile,
+        product_code: str,
+        alpha: float,
+        window_ratio: float,
+        interval: int,
+        lead_time: int,
+        lead_time_supplier: int,
+        service_level: float,
+        nb_sim: int,
+        rng_seed: int,
+    ):
+        sheet = _find_product_sheet_croston(xls, product_code)
+        stock_daily, cons_daily = _daily_consumption_and_stock_croston(xls_bytes, sheet)
+        vals = cons_daily.values
+        split_index = int(len(vals) * window_ratio)
+        if split_index < 2:
+            return pd.DataFrame()
+
+        rng = np.random.default_rng(rng_seed)
+        rows = []
+        rop_carry_running = 0.0
+        stock_after_interval = 0.0
+
+        for i in range(split_index, len(vals)):
+            if (i - split_index) % interval == 0:
+                train = vals[:i]
+                test_date = cons_daily.index[i]
+
+                fc = _croston_forecast_array_croston(train, alpha=alpha)
+                f = float(fc["forecast_per_period"])
+                sigma_period = float(pd.Series(train).std(ddof=1)) if i > 1 else 0.0
+                if not np.isfinite(sigma_period):
+                    sigma_period = 0.0
+
+                real_demand = _interval_sum_next_days(cons_daily, i, interval)              # C
+                stock_on_hand_running = _interval_sum_next_days(stock_daily, i, interval)   # B
+                stock_after_interval = stock_after_interval + stock_on_hand_running - real_demand
+
+                next_real_demand = _interval_sum_next_days(cons_daily, i + interval, interval) if (i + interval) < len(vals) else 0.0
+                can_cover_interval = "yes" if stock_after_interval >= next_real_demand else "no"
+                order_policy = "half_of_interval_demand" if can_cover_interval == "yes" else "shortfall_to_cover"
+
+                X_Lt = lead_time * f
+                sigma_Lt = sigma_period * np.sqrt(max(lead_time, 1e-9))
+                var_u = sigma_Lt**2 if sigma_Lt**2 > X_Lt else X_Lt + 1e-5
+                if _SCIPY_OK:
+                    ROP_u = _nbinom_quantile_scipy(X_Lt, var_u, service_level, nb_sim, rng)
+                else:
+                    ROP_u = _nb_quantile_fallback(X_Lt, var_u, service_level, nb_sim, rng)
+
+                totalL = lead_time + lead_time_supplier
+                X_Lt_Lw = totalL * f
+                sigma_Lt_Lw = sigma_period * np.sqrt(max(totalL, 1e-9))
+                var_f = sigma_Lt_Lw**2 if sigma_Lt_Lw**2 > X_Lt_Lw else X_Lt_Lw + 1e-5
+                if _SCIPY_OK:
+                    ROP_f = _nbinom_quantile_scipy(X_Lt_Lw, var_f, service_level, nb_sim, rng)
+                else:
+                    ROP_f = _nb_quantile_fallback(X_Lt_Lw, var_f, service_level, nb_sim, rng)
+
+                rop_carry_running += float(ROP_u - real_demand)
+                stock_status = "holding" if stock_after_interval > 0 else "rupture"
+
+                rows.append({
+                    "date": test_date.date(),
+                    "code": product_code,
+                    "interval": int(interval),
+                    "real_demand": float(real_demand),
+                    "stock_on_hand_running": float(stock_on_hand_running),
+                    "stock_after_interval": float(stock_after_interval),
+                    "can_cover_interval": can_cover_interval,
+                    "order_policy": order_policy,
+                    "reorder_point_usine": float(ROP_u),
+                    "lead_time_usine_days": int(lead_time),
+                    "lead_time_supplier_days": int(lead_time_supplier),
+                    "reorder_point_fournisseur": float(ROP_f),
+                    "stock_status": stock_status,
+                    "rop_usine_minus_real_running": float(rop_carry_running),
+                })
+
+        return pd.DataFrame(rows)
+
+    def compute_metrics_croston(df_run: pd.DataFrame):
+        if df_run.empty or "real_demand" not in df_run or "reorder_point_usine" not in df_run:
+            return np.nan, np.nan, np.nan, np.nan
+        est = df_run["reorder_point_usine"] / df_run["lead_time_usine_days"].replace(0, np.nan)
+        e = df_run["real_demand"] - est
+        ME = e.mean()
+        absME = e.abs().mean()
+        MSE = (e**2).mean()
+        RMSE = float(np.sqrt(MSE)) if np.isfinite(MSE) else np.nan
+        return ME, absME, MSE, RMSE
+
+    def _grid_and_final_croston(
+        product_codes: List[str],
+        alphas: List[float],
+        window_ratios: List[float],
+        recalc_intervals: List[int],
+        lead_time: int,
+        lead_time_supplier: int,
+        base_service_level: float,
+        nb_sim: int,
+        rng_seed: int,
+    ):
+        best_rows = []
+        for code in product_codes:
+            best_row = None
+            best_rmse = np.inf
+            for a in alphas:
+                for w in window_ratios:
+                    for itv in recalc_intervals:
+                        df_run = rolling_croston_with_rops_single_run(
+                            xls_bytes=xls_bytes, xls=XLF, product_code=code,
+                            alpha=a, window_ratio=w, interval=itv,
+                            lead_time=lead_time, lead_time_supplier=lead_time_supplier,
+                            service_level=base_service_level, nb_sim=nb_sim, rng_seed=rng_seed,
+                        )
+                        _, _, _, RMSE = compute_metrics_croston(df_run)
+                        if pd.notna(RMSE):
+                            if (RMSE < best_rmse * 0.99) or (np.isclose(RMSE, best_rmse, rtol=0.01) and best_row is not None and (
+                                (itv, a, w) > (best_row["recalc_interval"], best_row["alpha"], best_row["window_ratio"])
+                            )):
+                                best_rmse = RMSE
+                                best_row = {"code": code, "alpha": a, "window_ratio": w, "recalc_interval": itv, "RMSE": RMSE}
+            if best_row:
+                best_rows.append(best_row)
+
+        df_best_croston = pd.DataFrame(best_rows)
+
+        st.subheader("Croston — Best parameters (by RMSE)")
+        st.dataframe(df_best_croston, use_container_width=True, hide_index=True)
+
+        st.markdown("**Croston Final Tables (best params)**")
+        for _, r in df_best_croston.iterrows():
+            code = r["code"]; a = r["alpha"]; w = r["window_ratio"]; itv = r["recalc_interval"]
+            st.caption(f"Croston {code}: alpha={a}, window={w}, interval={itv}")
+            df_final = rolling_croston_with_rops_single_run(
+                xls_bytes=xls_bytes, xls=XLF, product_code=code,
+                alpha=float(a), window_ratio=float(w), interval=int(itv),
+                lead_time=lead_time, lead_time_supplier=lead_time_supplier,
+                service_level=base_service_level, nb_sim=nb_sim, rng_seed=rng_seed,
+            )
+            if not df_final.empty:
+                st.dataframe(df_final, use_container_width=True)
+        return df_best_croston
+
+    # ============================================================
+    # ==========================  SES  ============================
+    # ============================================================
+    def _find_product_sheet_ses(xls: pd.ExcelFile, code: str) -> str:
+        return _ts_find_sheet_for_code(xls, code)
+
+    def _daily_consumption_and_stock_ses(xls_bytes: bytes, sheet_name: str):
+        return _daily_B_and_C_positional(xls_bytes, sheet_name)
+
+    def _ses_forecast_array_ses(x, alpha: float):
+        x = pd.Series(x).fillna(0.0).astype(float).values
+        if len(x) == 0:
+            return {"forecast_per_period": 0.0}
+        l = x[0]
+        for t in range(1, len(x)):
+            l = alpha * x[t] + (1 - alpha) * l
+        return {"forecast_per_period": float(l)}
+
+    def rolling_ses_with_rops_single_run(
+        xls_bytes: bytes,
+        xls: pd.ExcelFile,
+        product_code: str,
+        alpha: float,
+        window_ratio: float,
+        interval: int,
+        lead_time: int,
+        lead_time_supplier: int,
+        service_level: float,
+        nb_sim: int,
+        rng_seed: int,
+    ):
+        sheet = _find_product_sheet_ses(xls, product_code)
+        stock_daily, cons_daily = _daily_consumption_and_stock_ses(xls_bytes, sheet)
+        vals = cons_daily.values
+        split_index = int(len(vals) * window_ratio)
+        if split_index < 2:
+            return pd.DataFrame()
+
+        rng = np.random.default_rng(rng_seed)
+        rows = []
+        rop_carry_running = 0.0
+        stock_after_interval = 0.0
+
+        for i in range(split_index, len(vals)):
+            if (i - split_index) % interval == 0:
+                train = vals[:i]
+                test_date = cons_daily.index[i]
+
+                fc = _ses_forecast_array_ses(train, alpha=alpha)
+                f = float(fc["forecast_per_period"])
+                sigma_period = float(pd.Series(train).std(ddof=1)) if i > 1 else 0.0
+                if not np.isfinite(sigma_period):
+                    sigma_period = 0.0
+
+                real_demand = _interval_sum_next_days(cons_daily, i, interval)              # C
+                stock_on_hand_running = _interval_sum_next_days(stock_daily, i, interval)   # B
+                stock_after_interval = stock_after_interval + stock_on_hand_running - real_demand
+
+                next_real_demand = _interval_sum_next_days(cons_daily, i + interval, interval) if (i + interval) < len(vals) else 0.0
+                can_cover_interval = "yes" if stock_after_interval >= next_real_demand else "no"
+                order_policy = "half_of_interval_demand" if can_cover_interval == "yes" else "shortfall_to_cover"
+
+                X_Lt = lead_time * f
+                sigma_Lt = sigma_period * np.sqrt(max(lead_time, 1e-9))
+                var_u = sigma_Lt**2 if sigma_Lt**2 > X_Lt else X_Lt + 1e-5
+                if _SCIPY_OK:
+                    ROP_u = _nbinom_quantile_scipy(X_Lt, var_u, service_level, nb_sim, rng)
+                else:
+                    ROP_u = _nb_quantile_fallback(X_Lt, var_u, service_level, nb_sim, rng)
+
+                totalL = lead_time + lead_time_supplier
+                X_Lt_Lw = totalL * f
+                sigma_Lt_Lw = sigma_period * np.sqrt(max(totalL, 1e-9))
+                var_f = sigma_Lt_Lw**2 if sigma_Lt_Lw**2 > X_Lt_Lw else X_Lt_Lw + 1e-5
+                if _SCIPY_OK:
+                    ROP_f = _nbinom_quantile_scipy(X_Lt_Lw, var_f, service_level, nb_sim, rng)
+                else:
+                    ROP_f = _nb_quantile_fallback(X_Lt_Lw, var_f, service_level, nb_sim, rng)
+
+                rop_carry_running += float(ROP_u - real_demand)
+                stock_status = "holding" if stock_after_interval > 0 else "rupture"
+
+                rows.append({
+                    "date": test_date.date(),
+                    "code": product_code,
+                    "interval": int(interval),
+                    "real_demand": float(real_demand),
+                    "stock_on_hand_running": float(stock_on_hand_running),
+                    "stock_after_interval": float(stock_after_interval),
+                    "can_cover_interval": can_cover_interval,
+                    "order_policy": order_policy,
+                    "reorder_point_usine": float(ROP_u),
+                    "lead_time_usine_days": int(lead_time),
+                    "lead_time_supplier_days": int(lead_time_supplier),
+                    "reorder_point_fournisseur": float(ROP_f),
+                    "stock_status": stock_status,
+                    "rop_usine_minus_real_running": float(rop_carry_running),
+                })
+
+        return pd.DataFrame(rows)
+
+    def compute_metrics_ses(df_run: pd.DataFrame):
+        if df_run.empty or "real_demand" not in df_run or "reorder_point_usine" not in df_run:
+            return np.nan, np.nan, np.nan, np.nan
+        est = df_run["reorder_point_usine"] / df_run["lead_time_usine_days"].replace(0, np.nan)
+        e = df_run["real_demand"] - est
+        ME = e.mean()
+        absME = e.abs().mean()
+        MSE = (e**2).mean()
+        RMSE = float(np.sqrt(MSE)) if np.isfinite(MSE) else np.nan
+        return ME, absME, MSE, RMSE
+
+    def _grid_and_final_ses(
+        product_codes: List[str],
+        alphas: List[float],
+        window_ratios: List[float],
+        recalc_intervals: List[int],
+        lead_time: int,
+        lead_time_supplier: int,
+        base_service_level: float,
+        nb_sim: int,
+        rng_seed: int,
+    ):
+        best_rows = []
+        for code in product_codes:
+            best_row = None
+            best_rmse = np.inf
+            for a in alphas:
+                for w in window_ratios:
+                    for itv in recalc_intervals:
+                        df_run = rolling_ses_with_rops_single_run(
+                            xls_bytes=xls_bytes, xls=XLF, product_code=code,
+                            alpha=a, window_ratio=w, interval=itv,
+                            lead_time=lead_time, lead_time_supplier=lead_time_supplier,
+                            service_level=base_service_level, nb_sim=nb_sim, rng_seed=rng_seed,
+                        )
+                        _, _, _, RMSE = compute_metrics_ses(df_run)
+                        if pd.notna(RMSE):
+                            if (RMSE < best_rmse * 0.99) or (np.isclose(RMSE, best_rmse, rtol=0.01) and best_row is not None and (
+                                (itv, a, w) > (best_row["recalc_interval"], best_row["alpha"], best_row["window_ratio"])
+                            )):
+                                best_rmse = RMSE
+                                best_row = {"code": code, "alpha": a, "window_ratio": w, "recalc_interval": itv, "RMSE": RMSE}
+            if best_row:
+                best_rows.append(best_row)
+
+        df_best_ses = pd.DataFrame(best_rows)
+
+        st.subheader("SES — Best parameters (by RMSE)")
+        st.dataframe(df_best_ses, use_container_width=True, hide_index=True)
+
+        st.markdown("**SES Final Tables (best params)**")
+        for _, r in df_best_ses.iterrows():
+            code = r["code"]; a = r["alpha"]; w = r["window_ratio"]; itv = r["recalc_interval"]
+            st.caption(f"SES {code}: alpha={a}, window={w}, interval={itv}")
+            df_final = rolling_ses_with_rops_single_run(
+                xls_bytes=xls_bytes, xls=XLF, product_code=code,
+                alpha=float(a), window_ratio=float(w), interval=int(itv),
+                lead_time=lead_time, lead_time_supplier=lead_time_supplier,
+                service_level=base_service_level, nb_sim=nb_sim, rng_seed=rng_seed,
+            )
+            if not df_final.empty:
+                st.dataframe(df_final, use_container_width=True)
+        return df_best_ses
+
+    # ---------- Detection & UI controls ----------
+    if XLF is not None:
+        codes = _ts_list_codes(XLF)
         if not codes:
             st.warning("Aucune feuille 'time serie *' détectée.")
-            codes = xls.sheet_names  # fallback manual
+            codes = XLF.sheet_names  # allow manual selection
 
         if codes:
-            c_left, c_right = st.columns([2,1], vertical_alignment="top")
+            c_left, c_right = st.columns([2,1])
             with c_left:
-                selected_codes = st.multiselect("Codes produit / Feuilles", options=codes, default=codes[:min(6, len(codes))])
-                methods = st.multiselect("Méthodes", options=["sba", "ses", "croston"], default=["sba", "ses", "croston"])
+                selected_codes = st.multiselect("Codes produit / Feuilles", options=codes, default=codes)
+                methods = st.multiselect("Méthodes", options=["SBA", "Croston", "SES"], default=["SBA", "Croston", "SES"])
                 alphas = st.multiselect("Alphas", [0.05, 0.1, 0.15, 0.2, 0.3, 0.4], default=[0.1, 0.2, 0.3, 0.4])
                 window_ratios = st.multiselect("Window ratios", [0.6, 0.7, 0.8], default=[0.6, 0.7, 0.8])
                 recalc_intervals = st.multiselect("Intervalles (jours)", [1, 2, 5, 10, 15, 20], default=[5, 10, 20])
             with c_right:
                 lead_time = st.number_input("Lead time usine (jours)", min_value=0, value=1, step=1)
                 lead_time_supplier = st.number_input("Lead time fournisseur + (jours)", min_value=0, value=3, step=1)
-                base_service_level = st.slider("Niveau de service (grid/best)", 0.50, 0.999, 0.95, 0.001)
-                nb_sim = st.number_input("Taille simulation NB", min_value=200, step=100, value=800)
+                base_service_level = st.slider("Niveau de service (grid)", 0.50, 0.999, 0.95, 0.001)
+                nb_sim = st.number_input("Taille simulation NB", min_value=100, step=100, value=800)
                 rng_seed = st.number_input("RNG seed", min_value=0, value=42, step=1)
 
             if not _SCIPY_OK:
-                st.warning("SciPy non disponible — ROP via **fallback Gamma–Poisson** (légères différences).")
+                st.warning("SciPy non disponible — ROP via **fallback Gamma–Poisson** (de légères différences sont possibles).")
 
-            run = st.button("▶️ Lancer les prévisions (grid search + résumé)")
+            run = st.button("▶️ Lancer les prévisions (grid search + best + tables)")
             if run:
                 if not selected_codes:
                     st.warning("Sélectionnez au moins un code/feuille.")
                 elif not methods:
                     st.warning("Sélectionnez au moins une méthode.")
                 else:
-                    tabs = st.tabs([m.upper() for m in methods])
-                    df_bests = {}
-                    for m, tab in zip(methods, tabs):
-                        with tab:
-                            with st.spinner(f"Exécution {m.upper()}…"):
-                                df_all, df_best = _grid_search_and_best(
-                                    file_like=_fc_src, product_codes=selected_codes, method=m,
-                                    alphas=alphas, window_ratios=window_ratios, intervals=recalc_intervals,
-                                    lead_time=int(lead_time), lead_time_supplier=int(lead_time_supplier),
-                                    service_level=float(base_service_level), nb_sim=int(nb_sim), rng_seed=int(rng_seed),
-                                )
-                            df_bests[m] = df_best.copy()
+                    df_best_sba = pd.DataFrame()
+                    df_best_croston = pd.DataFrame()
+                    df_best_ses = pd.DataFrame()
 
-                            c1, c2 = st.columns([2,1], vertical_alignment="top")
-                            with c1:
-                                st.subheader("Meilleures combinaisons par article")
-                                st.dataframe(df_best, use_container_width=True, hide_index=True)
-                            with c2:
-                                st.download_button(
-                                    "Télécharger (best) CSV",
-                                    data=df_best.to_csv(index=False).encode("utf-8"),
-                                    file_name=f"best_combos_{m}.csv", mime="text/csv",
-                                )
+                    if "SBA" in methods:
+                        df_best_sba = _grid_and_final_sba(
+                            product_codes=selected_codes, alphas=alphas, window_ratios=window_ratios,
+                            recalc_intervals=recalc_intervals, lead_time=int(lead_time),
+                            lead_time_supplier=int(lead_time_supplier), base_service_level=float(base_service_level),
+                            nb_sim=int(nb_sim), rng_seed=int(rng_seed),
+                        )
+                        st.download_button(
+                            "Télécharger SBA (best) CSV",
+                            data=df_best_sba.to_csv(index=False).encode("utf-8"),
+                            file_name=f"best_combos_SBA.csv", mime="text/csv",
+                        )
 
-                            st.subheader("Toutes les combinaisons testées")
-                            st.dataframe(df_all, use_container_width=True, hide_index=True)
-                            st.download_button(
-                                "Télécharger (grid) CSV",
-                                data=df_all.to_csv(index=False).encode("utf-8"),
-                                file_name=f"grid_search_{m}.csv", mime="text/csv",
-                            )
+                    if "Croston" in methods:
+                        df_best_croston = _grid_and_final_croston(
+                            product_codes=selected_codes, alphas=alphas, window_ratios=window_ratios,
+                            recalc_intervals=recalc_intervals, lead_time=int(lead_time),
+                            lead_time_supplier=int(lead_time_supplier), base_service_level=float(base_service_level),
+                            nb_sim=int(nb_sim), rng_seed=int(rng_seed),
+                        )
+                        st.download_button(
+                            "Télécharger Croston (best) CSV",
+                            data=df_best_croston.to_csv(index=False).encode("utf-8"),
+                            file_name=f"best_combos_Croston.csv", mime="text/csv",
+                        )
 
-                            # Detailed table for a product at best params
-                            st.markdown("### Table détaillée (meilleurs paramètres)")
-                            code_for_table = st.selectbox(
-                                "Produit", options=sorted(df_best["code"].astype(str).unique()),
-                                key=f"{m}_table_code"
-                            )
-                            if code_for_table:
-                                row = df_best[df_best["code"].astype(str) == str(code_for_table)]
-                                if not row.empty:
-                                    a = float(row.iloc[0]["alpha"])
-                                    w = float(row.iloc[0]["window_ratio"])
-                                    itv = int(row.iloc[0]["recalc_interval"])
-                                    df_final_table = _rolling_with_rops_single_run(
-                                        file_like=_fc_src, product_code=code_for_table, method=m,
-                                        alpha=a, window_ratio=w, interval=itv,
-                                        lead_time=int(lead_time), lead_time_supplier=int(lead_time_supplier),
-                                        service_level=float(base_service_level),
-                                        nb_sim=int(nb_sim), rng_seed=int(rng_seed),
-                                    )
-                                    if df_final_table.empty:
-                                        st.warning("Données nulles dans la fenêtre d’évaluation pour ce produit.")
-                                    else:
-                                        disp_cols = [
-                                            "date", "code", "interval", "real_demand",
-                                            "stock_on_hand_running", "stock_after_interval",
-                                            "can_cover_interval", "order_policy",
-                                            "reorder_point_usine", "lead_time_usine_days",
-                                            "lead_time_supplier_days", "reorder_point_fournisseur",
-                                            "stock_status", "rop_usine_minus_real_running"
-                                        ]
-                                        disp_cols = [c for c in disp_cols if c in df_final_table.columns]
-                                        st.dataframe(df_final_table[disp_cols], use_container_width=True)
-                                        st.download_button(
-                                            "Télécharger la table (CSV)",
-                                            data=df_final_table[disp_cols].to_csv(index=False).encode("utf-8"),
-                                            file_name=f"details_{m}_{code_for_table}.csv", mime="text/csv"
-                                        )
+                    if "SES" in methods:
+                        df_best_ses = _grid_and_final_ses(
+                            product_codes=selected_codes, alphas=alphas, window_ratios=window_ratios,
+                            recalc_intervals=recalc_intervals, lead_time=int(lead_time),
+                            lead_time_supplier=int(lead_time_supplier), base_service_level=float(base_service_level),
+                            nb_sim=int(nb_sim), rng_seed=int(rng_seed),
+                        )
+                        st.download_button(
+                            "Télécharger SES (best) CSV",
+                            data=df_best_ses.to_csv(index=False).encode("utf-8"),
+                            file_name=f"best_combos_SES.csv", mime="text/csv",
+                        )
 
-                    # ---------------- Comparison Tables (Mean Holding & CT) ----------------
+                    # ======================= Comparison Tables =======================
                     st.markdown("---")
-                    st.subheader("📊 Tableaux Comparatifs — Mean Holding & CT")
+                    st.header("📊 Tableaux de comparaison — Mean Holding & CT")
 
-                    # Parameters for CT
-                    A_w, A_R = 50, 70
-                    pi, tau = 1.0, 1.0
-                    T_w = 1.0
-                    C_w = 5.0
-                    C_R = 8.0
+                    # ---- Parameters for CT formula (adjust as needed) ----
+                    with st.expander("Paramètres CT"):
+                        Aw = st.number_input("A_w (coût commande entrepôt)", value=50.0, step=1.0)
+                        AR = st.number_input("A_R (coût commande détaillant)", value=70.0, step=1.0)
+                        pi  = st.number_input("π (coefficient entrepôt)", value=1.0, step=0.1, format="%.3f")
+                        tau = st.number_input("τ (coefficient détaillant)", value=1.0, step=0.1, format="%.3f")
+                        Tw  = st.number_input("T_w (fenêtre de temps)", value=1.0, step=0.1, format="%.3f")
+                        Cw  = st.number_input("C_w (coût unitaire entrepôt)", value=5.0, step=0.1, format="%.3f")
+                        CR  = st.number_input("C_R (coût unitaire détaillant)", value=8.0, step=0.1, format="%.3f")
 
                     def compute_ct(D, Qw, Qr):
                         Iw_prime = Qw / 2.0
                         Ir_prime = Qr / 2.0
-                        Cw_prime = C_w
-                        Cr_prime = C_R - C_w
+                        Cw_prime = Cw
+                        Cr_prime = CR - Cw
                         return (
-                            A_w * (D / Qw if Qw > 0 else 0)
-                            + pi * T_w * Cw_prime * Iw_prime
-                            + A_R * (D / Qr if Qr > 0 else 0)
+                            Aw * (D / Qw if Qw > 0 else 0)
+                            + pi * Tw * Cw_prime * Iw_prime
+                            + AR * (D / Qr if Qr > 0 else 0)
                             + tau * Cr_prime * Ir_prime
                         )
 
-                    SERVICE_LEVELS = [0.90, 0.92, 0.95, 0.98]
-                    records_holding, records_ct = [], []
+                    svc_levels = st.multiselect("Niveaux de service à comparer", [0.90, 0.92, 0.95, 0.98], default=[0.90, 0.95, 0.98])
 
-                    for method_name, df_best in df_bests.items():
-                        if df_best is None or df_best.empty:
-                            continue
-                        for _, r in df_best.iterrows():
-                            code = r["code"]
-                            a, w, itv = float(r["alpha"]), float(r["window_ratio"]), int(r["recalc_interval"])
-                            for sl in SERVICE_LEVELS:
-                                df_run = _rolling_with_rops_single_run(
-                                    file_like=_fc_src, product_code=code, method=method_name,
-                                    alpha=a, window_ratio=w, interval=itv,
-                                    lead_time=int(lead_time), lead_time_supplier=int(lead_time_supplier),
-                                    service_level=float(sl), nb_sim=int(nb_sim), rng_seed=int(rng_seed),
+                    make_tables = st.button("🧮 Calculer les tableaux de comparaison")
+                    if make_tables:
+                        records_holding = []
+                        records_ct = []
+
+                        items = []
+                        if not df_best_sba.empty:
+                            items.append(("SBA", df_best_sba, rolling_sba_with_rops_single_run))
+                        if not df_best_croston.empty:
+                            items.append(("Croston", df_best_croston, rolling_croston_with_rops_single_run))
+                        if not df_best_ses.empty:
+                            items.append(("SES", df_best_ses, rolling_ses_with_rops_single_run))
+
+                        if not items:
+                            st.info("Lancez d'abord les prévisions pour au moins une méthode.")
+                        else:
+                            for method_name, df_best, runner in items:
+                                for _, r in df_best.iterrows():
+                                    code = r["code"]
+                                    alpha, w, itv = r["alpha"], r["window_ratio"], r["recalc_interval"]
+
+                                    for sl in svc_levels:
+                                        df_run = runner(
+                                            xls_bytes=xls_bytes, xls=XLF, product_code=code,
+                                            alpha=float(alpha), window_ratio=float(w), interval=int(itv),
+                                            lead_time=int(lead_time), lead_time_supplier=int(lead_time_supplier),
+                                            service_level=float(sl), nb_sim=int(nb_sim), rng_seed=int(rng_seed),
+                                            **({"variant": "sba"} if method_name == "SBA" else {})
+                                        )
+
+                                        if df_run.empty:
+                                            mean_holding_val = np.nan
+                                            CT_val = np.nan
+                                        else:
+                                            # Mean Holding = mean of (ROP_u - demand)_running where stock_status=="holding"
+                                            hold_mask = (df_run["stock_status"].astype(str) == "holding")
+                                            if hold_mask.any():
+                                                mean_holding_val = df_run.loc[hold_mask, "rop_usine_minus_real_running"].mean()
+                                            else:
+                                                mean_holding_val = np.nan
+
+                                            D  = df_run["real_demand"].sum()
+                                            Qw = df_run["reorder_point_fournisseur"].mean()
+                                            Qr = df_run["reorder_point_usine"].mean()
+                                            CT_val = compute_ct(D, Qw, Qr)
+
+                                        records_holding.append({
+                                            "product": code,
+                                            "method": method_name,
+                                            "service_level": f"{int(sl*100)}%",
+                                            "Mean_Holding": mean_holding_val,
+                                        })
+                                        records_ct.append({
+                                            "product": code,
+                                            "method": method_name,
+                                            "service_level": f"{int(sl*100)}%",
+                                            "CT": CT_val,
+                                        })
+
+                            df_holding = pd.DataFrame(records_holding)
+                            df_ct = pd.DataFrame(records_ct)
+
+                            if not df_holding.empty:
+                                table_holding = df_holding.pivot_table(
+                                    index="product", columns=["method", "service_level"], values="Mean_Holding"
                                 )
-                                if df_run.empty:
-                                    mean_holding_val = np.nan
-                                    CT_val = np.nan
-                                else:
-                                    # Mean Holding: mean of positive ROP surplus in running measure
-                                    mean_holding_val = df_run.loc[df_run["stock_status"] == "holding",
-                                                                  "rop_usine_minus_real_running"].mean()
-                                    D = df_run["real_demand"].sum()
-                                    Qw = df_run["reorder_point_fournisseur"].mean()
-                                    Qr = df_run["reorder_point_usine"].mean()
-                                    CT_val = compute_ct(D, Qw, Qr)
+                                st.subheader("📊 Comparison Table — Mean Holding")
+                                st.dataframe(table_holding, use_container_width=True)
+                                st.download_button(
+                                    "Télécharger Mean Holding (CSV)",
+                                    data=table_holding.to_csv().encode("utf-8"),
+                                    file_name="comparison_mean_holding.csv",
+                                    mime="text/csv"
+                                )
+                            else:
+                                st.info("Pas de données pour Mean Holding.")
 
-                                records_holding.append({
-                                    "product": code,
-                                    "method": method_name.upper(),
-                                    "service_level": f"{int(sl*100)}%",
-                                    "Mean_Holding": mean_holding_val,
-                                })
-                                records_ct.append({
-                                    "product": code,
-                                    "method": method_name.upper(),
-                                    "service_level": f"{int(sl*100)}%",
-                                    "CT": CT_val,
-                                })
-
-                    df_holding = pd.DataFrame(records_holding)
-                    df_ct = pd.DataFrame(records_ct)
-
-                    if not df_holding.empty:
-                        table_holding = df_holding.pivot_table(
-                            index="product", columns=["method", "service_level"], values="Mean_Holding"
-                        )
-                        st.markdown("**Mean Holding (pivot)**")
-                        st.dataframe(table_holding, use_container_width=True)
-                        st.download_button(
-                            "Télécharger Mean Holding (CSV)",
-                            data=table_holding.to_csv().encode("utf-8"),
-                            file_name="comparison_mean_holding.csv",
-                            mime="text/csv"
-                        )
-                    else:
-                        st.info("Pas de données pour Mean Holding.")
-
-                    if not df_ct.empty:
-                        table_ct = df_ct.pivot_table(
-                            index="product", columns=["method", "service_level"], values="CT"
-                        )
-                        st.markdown("**CT (pivot)**")
-                        st.dataframe(table_ct, use_container_width=True)
-                        st.download_button(
-                            "Télécharger CT (CSV)",
-                            data=table_ct.to_csv().encode("utf-8"),
-                            file_name="comparison_ct.csv",
-                            mime="text/csv"
-                        )
-                    else:
-                        st.info("Pas de données pour CT.")
+                            if not df_ct.empty:
+                                table_ct = df_ct.pivot_table(
+                                    index="product", columns=["method", "service_level"], values="CT"
+                                )
+                                st.subheader("💰 Comparison Table — CT")
+                                st.dataframe(table_ct, use_container_width=True)
+                                st.download_button(
+                                    "Télécharger CT (CSV)",
+                                    data=table_ct.to_csv().encode("utf-8"),
+                                    file_name="comparison_ct.csv",
+                                    mime="text/csv"
+                                )
+                            else:
+                                st.info("Pas de données pour CT.")
         else:
             st.info("Ajoutez un classeur avec des feuilles de type **time serie <CODE>**.")
