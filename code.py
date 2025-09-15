@@ -1,4 +1,11 @@
 # app.py
+# One-file Streamlit app:
+# - Classification (p, CV^2) + visual
+# - Optimisation (n*, Qr*, Qw*) from workbook sheets
+# - Forecasts + ROP via grid search for SBA / Croston / SES
+# - Detailed table for best params (with order column)
+# - Comparison tables: Mean Holding & CT across service levels
+
 import io
 import re
 from typing import Tuple, List, Dict, Optional
@@ -475,7 +482,7 @@ def _fc_rolling_with_rops_single_run(
             train = vals[:i]
             fc = _fc_forecast_per_method(train, alpha=alpha, method=method)
             f = float(fc["forecast_per_period"])
-            sigma_period = float(pd.Series(train).std(ddof=1))
+            sigma_period = float(pd.Series(train).std(ddof=1)) if i > 1 else 0.0
             if not np.isfinite(sigma_period):
                 sigma_period = 0.0
 
