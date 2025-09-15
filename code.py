@@ -344,20 +344,17 @@ def _fc_find_product_sheet(xls: pd.ExcelFile, code: str) -> str:
     raise ValueError(f"Onglet pour '{code}' introuvable.")
 
 def _fc_daily_B_and_C_simple(xls_bytes: bytes, sheet_name: str):
+    # Strict positional reader: A=date, B=stock_on_hand/receipts, C=consommation
     df = pd.read_excel(io.BytesIO(xls_bytes), sheet_name=sheet_name)
-
-    st.write("✅ DEBUG: First rows of the sheet", df.head())  # 👈 add this
-
-    cols = {c: _norm(str(c)) for c in df.columns}
-    date_col = next((c for c, nc in cols.items() if "date" in nc), df.columns[0])
-    cons_col = next((c for c, nc in cols.items() if "cons" in nc or "demande" in nc or "qte" in nc), df.columns[2])
-    stock_col = next((c for c, nc in cols.items() if "stock" in nc or "recept" in nc), df.columns[1])
+    if df.shape[1] < 3:
+        raise ValueError(f"Feuille '{sheet_name}' doit avoir au moins 3 colonnes (A,B,C).")
+    date_col  = df.columns[0]
+    stock_col = df.columns[1]
+    cons_col  = df.columns[2]
 
     dates = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
     stock = _parse_num_locale(df[stock_col])
     cons  = _parse_num_locale(df[cons_col])
-
-    st.write("✅ DEBUG: Parsed consumption values", cons.head())  # 👈 add this
 
     g = (
         pd.DataFrame({"date": dates, "b": stock, "c": cons})
@@ -371,7 +368,6 @@ def _fc_daily_B_and_C_simple(xls_bytes: bytes, sheet_name: str):
     stock_daily = g["b"].reindex(full_idx, fill_value=0.0); stock_daily.index.name = "date"
     cons_daily  = g["c"].reindex(full_idx, fill_value=0.0); cons_daily.index.name  = "date"
     return stock_daily, cons_daily
-
 
 def _nb_quantile_fallback(mean_, var_, service_level, nb_sim, rng):
     mean_ = float(max(mean_, 0.0))
