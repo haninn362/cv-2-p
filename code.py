@@ -185,6 +185,10 @@ def grid_search_all_methods(file_path, product_code):
 # ==================================================
 # PARTIE 3 : Simulation finale avec ROP (improved)
 # ==================================================
+def _interval_sum_next_days(daily: pd.Series, start_idx: int, interval: int) -> float:
+    s, e = start_idx + 1, start_idx + 1 + interval
+    return float(pd.Series(daily).iloc[s:e].sum())
+
 def simulate_orders(file_path, best_per_code, qr_map, service_level=SERVICE_LEVEL):
     results = []
     rng = np.random.default_rng(RNG_SEED)
@@ -235,15 +239,18 @@ def simulate_orders(file_path, best_per_code, qr_map, service_level=SERVICE_LEVE
             X_Lt = LEAD_TIME * f
             sigma_Lt = sigma_period * np.sqrt(max(LEAD_TIME, 1e-9))
             var_u = sigma_Lt**2 if sigma_Lt**2 > X_Lt else X_Lt+1e-5
+            if var_u <= X_Lt:
+                r_nb = 1e6
+            else:
+                r_nb = X_Lt**2/(var_u - X_Lt)
             p_nb = min(max(X_Lt/var_u, 1e-12),1-1e-12)
-            r_nb = X_Lt**2/(var_u - X_Lt) if var_u > X_Lt else 1e6
             ROP_u = float(np.percentile(
                 nbinom.rvs(r_nb, p_nb, size=NB_SIM, random_state=rng),
                 100*service_level
             ))
 
-            # --- Consume demand ---
-            real_demand = float(vals[i])
+            # --- Consume demand (sum over interval) ---
+            real_demand = _interval_sum_next_days(cons_daily, i, interval)
             stock_on_hand -= real_demand
 
             # --- Check rupture ---
@@ -298,12 +305,30 @@ def plot_tradeoff(df_summary):
         st.warning("Pas de résultats pour tracer la sensibilité.")
         return
     
+    # --- Adjust extreme cases ---
+    df_adj = df_summary.copy()
+    adjusted_rows = []
+    for code in df_adj["code"].unique():
+        sub = df_adj[df_adj["code"] == code]
+        if (sub["rupture_pct"] == 0).all():  
+            # keep only min holding
+            min_row = sub.loc[sub["holding_pct"].idxmin()]
+            adjusted_rows.append(min_row)
+        elif (sub["holding_pct"] == 0).all():  
+            # keep only min rupture
+            min_row = sub.loc[sub["rupture_pct"].idxmin()]
+            adjusted_rows.append(min_row)
+        else:
+            adjusted_rows.append(sub)
+    df_adj = pd.concat(adjusted_rows if adjusted_rows else [df_adj])
+
+    # --- Plot ---
     plt.figure(figsize=(8,6))
-    methods = df_summary["method"].unique()
+    methods = df_adj["method"].unique()
     markers = {"ses":"o", "croston":"s", "sba":"^"}
     
     for method in methods:
-        subset = df_summary[df_summary["method"] == method]
+        subset = df_adj[df_adj["method"] == method]
         plt.scatter(subset["holding_pct"], subset["rupture_pct"],
                     label=method, marker=markers.get(method,"o"))
         for _, row in subset.iterrows():
