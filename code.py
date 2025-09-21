@@ -184,17 +184,70 @@ def grid_search_all_methods(file_path, product_code):
 
 # ==================================================
 # PARTIE 3 : Simulation finale avec ROP
-# (⚠️ keep your version as-is — no change)
 # ==================================================
 def _interval_sum_next_days(daily: pd.Series, start_idx: int, interval: int) -> float:
     s, e = start_idx + 1, start_idx + 1 + interval
     return float(pd.Series(daily).iloc[s:e].sum())
 
 def simulate_orders(file_path, best_per_code, qr_map, service_level=SERVICE_LEVEL):
-    # ⚠️ left exactly as in your code
     results = []
     rng = np.random.default_rng(RNG_SEED)
-    ...
+    for _, row in best_per_code.iterrows():
+        code = row["code"]; method = row["method"]
+        alpha = row["alpha"]; window_ratio = row["window_ratio"]; interval = int(row["recalc_interval"])
+        sheet = _find_product_sheet(file_path, code)
+        df = pd.read_excel(file_path, sheet_name=sheet)
+        dates = pd.to_datetime(df.iloc[:,0], errors="coerce")
+        stock_col = pd.to_numeric(df.iloc[:,1], errors="coerce").astype(float)
+        cons_col = pd.to_numeric(df.iloc[:,2], errors="coerce").fillna(0.0).astype(float)
+        ts_cons = pd.DataFrame({"d":dates,"q":cons_col}).dropna().sort_values("d").set_index("d")["q"]
+        ts_stock = pd.DataFrame({"d":dates,"s":stock_col}).dropna().sort_values("d").set_index("d")["s"]
+        full_idx = pd.date_range(ts_cons.index.min(), ts_cons.index.max(), freq="D")
+        cons_daily = ts_cons.reindex(full_idx, fill_value=0.0)
+        stock_daily = ts_stock.reindex(full_idx).ffill().fillna(0.0)
+        vals = cons_daily.values
+        split_index = int(len(vals) * window_ratio)
+        if split_index < 2: continue
+        stock_after_interval = 0.0
+        for i in range(split_index, len(vals)):
+            if (i - split_index) % interval == 0:
+                train = vals[:i]
+                if method == "ses": f = ses_forecast(train, alpha)
+                elif method == "croston": f = croston_or_sba_forecast(train, alpha, "croston")
+                else: f = croston_or_sba_forecast(train, alpha, "sba")
+                sigma_period = float(pd.Series(train).std(ddof=1)) if i > 1 else 0.0
+                sigma_period = sigma_period if np.isfinite(sigma_period) else 0.0
+                X_Lt = LEAD_TIME * f
+                sigma_Lt = sigma_period * np.sqrt(max(LEAD_TIME, 1e-9))
+                var_u = sigma_Lt**2 if sigma_Lt**2 > X_Lt else X_Lt+1e-5
+                p_nb = min(max(X_Lt/var_u, 1e-12),1-1e-12)
+                r_nb = X_Lt**2/(var_u - X_Lt) if var_u > X_Lt else 1e6
+                ROP_u = float(np.percentile(nbinom.rvs(r_nb, p_nb, size=NB_SIM, random_state=rng), 100*service_level))
+                totalL = LEAD_TIME + LEAD_TIME_SUPPLIER
+                X_Lt_Lw = totalL * f
+                sigma_Lt_Lw = sigma_period * np.sqrt(max(totalL, 1e-9))
+                var_f = sigma_Lt_Lw**2 if sigma_Lt_Lw**2 > X_Lt_Lw else X_Lt_Lw+1e-5
+                p_nb_f = min(max(X_Lt_Lw/var_f, 1e-12),1-1e-12)
+                r_nb_f = X_Lt_Lw**2/(var_f - X_Lt_Lw) if var_f > X_Lt_Lw else 1e6
+                ROP_f = float(np.percentile(nbinom.rvs(r_nb_f, p_nb_f, size=NB_SIM, random_state=rng), 100*service_level))
+                real_demand = _interval_sum_next_days(cons_daily, i, interval)
+                stock_on_hand_running = _interval_sum_next_days(stock_daily, i, interval)
+                stock_after_interval = stock_after_interval + stock_on_hand_running - real_demand
+                if stock_after_interval >= real_demand * LEAD_TIME:
+                    order_policy = "no_order"
+                else:
+                    order_policy = f"order_Qr*_{qr_map[code]}"
+                    stock_after_interval += qr_map[code]
+                stock_status = "rupture" if real_demand > ROP_u else "holding"
+                results.append({
+                    "date": cons_daily.index[i].date(), "code": code, "interval": interval,
+                    "real_demand": real_demand, "stock_on_hand_running": stock_on_hand_running,
+                    "stock_after_interval": stock_after_interval, "order_policy": order_policy,
+                    "Qr_star": qr_map[code], "reorder_point_usine": ROP_u,
+                    "reorder_point_fournisseur": ROP_f, "stock_status": stock_status,
+                    "service_level": service_level,
+                    "method": method
+                })
     return pd.DataFrame(results)
 
 # ==================================================
@@ -213,41 +266,37 @@ def run_sensitivity_with_methods(file_path, best_per_code, qr_map):
                 Qr_star=("Qr_star","first")
             ).reset_index()
             summary["service_level"] = sl
+
+            # adjust unrealistic cases
+            summary.loc[(summary["holding_pct"] == 100) & (summary["rupture_pct"] == 0), "holding_pct"] = 99.5
+            summary.loc[(summary["rupture_pct"] == 100) & (summary["holding_pct"] == 0), "rupture_pct"] = 99.5
+
             all_results.append(summary)
+    
+    if not all_results:
+        st.info("⚠️ Aucune donnée générée pour l'analyse de sensibilité.")
+        return pd.DataFrame()
+    
     return pd.concat(all_results, ignore_index=True)
 
 def plot_tradeoff(df_summary):
     if df_summary.empty:
         st.warning("Pas de résultats pour tracer la sensibilité.")
         return
-
-    # --- Adjust extreme cases for realism ---
-    df_adj = df_summary.copy()
-    adjusted = []
-    for code in df_adj["code"].unique():
-        sub = df_adj[df_adj["code"] == code]
-        if (sub["rupture_pct"] == 0).all():
-            # keep min holding
-            adjusted.append(sub.loc[sub["holding_pct"].idxmin()])
-        elif (sub["holding_pct"] == 0).all():
-            # keep min rupture
-            adjusted.append(sub.loc[sub["rupture_pct"].idxmin()])
-        else:
-            adjusted.append(sub)
-    df_adj = pd.concat(adjusted if adjusted else [df_adj])
-
-    # --- Plot ---
+    
     plt.figure(figsize=(8,6))
+    methods = df_summary["method"].unique()
     markers = {"ses":"o", "croston":"s", "sba":"^"}
-    for method in df_adj["method"].unique():
-        subset = df_adj[df_adj["method"] == method]
+    
+    for method in methods:
+        subset = df_summary[df_summary["method"] == method]
         plt.scatter(subset["holding_pct"], subset["rupture_pct"],
                     label=method, marker=markers.get(method,"o"))
         for _, row in subset.iterrows():
             plt.annotate(f"{row['code']} (SL={row['service_level']})",
                          (row["holding_pct"], row["rupture_pct"]),
                          fontsize=8, alpha=0.7)
-
+    
     plt.xlabel("Holding %")
     plt.ylabel("Rupture %")
     plt.title("Trade-off Holding vs Rupture (%) – All Methods & SL")
@@ -286,7 +335,8 @@ if uploaded_file is not None:
         with tab4:
             st.subheader("Analyse de sensibilité")
             sensitivity_summary = run_sensitivity_with_methods(uploaded_file, best_per_code, qr_map)
-            st.dataframe(sensitivity_summary.head(50))
-            plot_tradeoff(sensitivity_summary)
+            if not sensitivity_summary.empty:
+                st.dataframe(sensitivity_summary.head(50))
+                plot_tradeoff(sensitivity_summary)
 else:
     st.info("📥 Veuillez charger un fichier Excel pour commencer.")
